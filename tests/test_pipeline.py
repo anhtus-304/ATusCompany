@@ -350,3 +350,129 @@ def test_websocket_office_feed(tmp_path, monkeypatch):
 def test_qa_does_not_touch_project_data(tmp_path):
     _built(tmp_path, "C", "p17")
     assert not (tmp_path / "p17" / "api" / "data").exists()
+
+
+# ---------------------------------------------------------------- phase 4
+
+def _client(tmp_path, monkeypatch):
+    monkeypatch.setenv("VTD_WORKSPACE", str(tmp_path / "ws"))
+    monkeypatch.setenv("VTD_DB", str(tmp_path / "db.sqlite3"))
+    import importlib
+
+    import backend.app as appmod
+    importlib.reload(appmod)
+    from fastapi.testclient import TestClient
+    return TestClient(appmod.app), appmod
+
+
+def _wait(c, pid):
+    for _ in range(150):
+        p = c.get(f"/api/projects/{pid}").json()
+        if p["status"] != "running":
+            return p
+        time.sleep(0.05)
+    raise AssertionError("timeout")
+
+
+def test_returning_client_memory(tmp_path, monkeypatch):
+    c, _ = _client(tmp_path, monkeypatch)
+    # First project: pick the fast option and approve.
+    pid = c.post("/api/projects", json={"message": MSG}).json()["id"]
+    _wait(c, pid)
+    c.post(f"/api/projects/{pid}/choice", json={"option_id": "A"})
+    p1 = _wait(c, pid)
+    assert p1["client"]["name"] == "Mộc Coffee"
+    assert c.post(f"/api/projects/{pid}/decision", json={"approve": True, "note": "Khách thích tông nâu"}).status_code == 200
+    cid = p1["client"]["id"]
+    assert c.post(f"/api/clients/{cid}/notes", json={"text": "Khách muốn dùng ảnh thật, không dùng ảnh minh họa"}).json()["ok"]
+
+    # Second project for the same client, no budget mentioned this time.
+    pid2 = c.post("/api/projects", json={"message": "Thêm trang khuyến mãi mùa đông cho 'Mộc Coffee'"}).json()["id"]
+    p2 = _wait(c, pid2)
+    assert p2["status"] == "awaiting_choice"
+    brief = p2["artifacts"]["brief"]
+    assert brief["budget"] == "5 triệu", "budget remembered from the last project"
+    assert not any("Ngân sách" in q for q in brief["open_questions"]), "don't ask again"
+    assert any("Khách quen" in a for a in brief["assumptions"])
+    assert any("ảnh thật" in a for a in brief["assumptions"])
+    proposal = p2["artifacts"]["proposal"]
+    assert proposal["recommended"] == "A", "recommends the tier the client chose before"
+    assert "Khách quen" in proposal["reasoning"]
+    mem = c.get(f"/api/clients/{cid}").json()["memory"]
+    kinds = [d["kind"] for d in mem["decisions"]]
+    assert kinds == ["choice", "approved", "note"]
+    assert mem["projects"][0]["chosen_tier"] == "fast"
+    clients = c.get("/api/clients").json()
+    assert clients[0]["name"] == "Mộc Coffee" and clients[0]["projects"] == 2
+
+
+def test_new_client_without_quotes_is_walk_in(tmp_path, monkeypatch):
+    c, _ = _client(tmp_path, monkeypatch)
+    pid = c.post("/api/projects", json={"message": "Làm landing page cho phòng gym", "client": "Gym Sức Sống"}).json()["id"]
+    p = _wait(c, pid)
+    assert p["client"]["name"] == "Gym Sức Sống"
+    assert not any("Khách quen" in a for a in p["artifacts"]["brief"]["assumptions"])
+
+
+def test_scorecard_and_export(tmp_path, monkeypatch):
+    c, appmod = _client(tmp_path, monkeypatch)
+    pid = c.post("/api/projects", json={"message": MSG}).json()["id"]
+    _wait(c, pid)
+    c.post(f"/api/projects/{pid}/choice", json={"option_id": "C"})
+    _wait(c, pid)
+    assert c.get(f"/api/projects/{pid}/export").status_code == 409, "no export before approval"
+    # Customer data written by the real server must never leak through preview or export.
+    data = tmp_path / "ws" / pid / "api" / "data"
+    data.mkdir(parents=True)
+    (data / "api_contact.jsonl").write_text('{"name": "Lan", "phone": "0901234567"}\n')
+    assert c.get(f"/preview/{pid}/api/data/api_contact.jsonl").status_code == 404
+    assert c.get(f"/preview/{pid}/api/server.py").status_code == 404
+    c.post(f"/api/projects/{pid}/decision", json={"approve": True})
+    r = c.get(f"/api/projects/{pid}/export")
+    assert r.status_code == 200
+    import io
+    import zipfile
+    names = zipfile.ZipFile(io.BytesIO(r.content)).namelist()
+    assert f"{pid}/index.html" in names and f"{pid}/api/server.py" in names
+    assert any(n.startswith(f"{pid}/.git/") for n in names), "client gets the project's git history"
+    assert not any("/api/data/" in n for n in names)
+
+    card = c.get("/api/agents/scorecard").json()
+    assert card["frontend"]["firstPassRate"] == 1.0 and card["frontend"]["avgRounds"] == 1
+    assert card["backend"]["firstPassRate"] == 1.0
+    assert card["reviewer"]["findingsPerProject"] == 0
+    assert card["qa"]["checksPerProject"] > 20
+    assert card["reporter"]["approvalRate"] == 1.0
+    assert card["designer"]["tasksDone"] == 1 and card["designer"]["avgSeconds"] is not None
+    with c.websocket_connect("/ws/events") as ws:
+        snap = ws.receive_json()
+        fe = next(a for a in snap["agents"] if a["id"] == "frontend")
+        assert fe["metrics"]["firstPassRate"] == 1.0
+
+
+def test_first_pass_metric_drops_when_dev_needs_fixes(tmp_path, monkeypatch):
+    real_backend = team.backend_dev
+
+    def broken_once(llm, spec, ws, failures=None, previous=None):
+        out = real_backend(llm, spec, ws, failures, previous)
+        if not failures:
+            ws.write("api/server.py", ws.read("api/server.py").replace('parts[0] in ("api", ".git", ".vtd")', "False"))
+        return out
+
+    monkeypatch.setattr(team, "backend_dev", broken_once)
+
+    class MetricSink(MemSink):
+        def __init__(self):
+            super().__init__()
+            self.metrics = []
+
+        def metric(self, pid, agent, name, value):
+            self.metrics.append((agent, name, value))
+
+    sink = MetricSink()
+    plan_project("p18", MSG, sink)
+    build_project("p18", "C", sink, tmp_path)
+    m = {(a, n): v for a, n, v in sink.metrics}
+    assert m[("backend_dev", "first_pass")] == 0.0 and m[("backend_dev", "rounds")] == 2
+    assert m[("frontend_dev", "first_pass")] == 1.0
+    assert ("designer", "seconds") in m
