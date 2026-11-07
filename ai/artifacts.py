@@ -45,6 +45,49 @@ class Spec(BaseModel):
     palette: list[str] = Field(description="3-5 mã màu hex")
     tech: str = Field(description="Công nghệ, giai đoạn 1 luôn là HTML + CSS tĩnh")
     acceptance_criteria: list[str]
+    features: list[str] = Field(default_factory=list,
+                                description="Mã tính năng, được điền sau khi sếp chọn phương án")
+    meta_description: str = Field(default="", description="Mô tả ngắn cho SEO, 1 câu")
+
+
+Tier = Literal["fast", "balanced", "premium"]
+
+# Design features the Frontend Dev knows how to build and QA knows how to check.
+FEATURES = {
+    "responsive": "Responsive tới 360px",
+    "sticky_nav": "Thanh điều hướng dính trên cùng",
+    "dark_mode": "Tự đổi giao diện tối theo máy người xem",
+    "animations": "Hiệu ứng xuất hiện nhẹ khi cuộn (CSS)",
+    "faq_accordion": "Mục hỏi đáp dạng mở/đóng",
+    "contact_form": "Form liên hệ gửi qua email (mailto)",
+    "seo_meta": "Meta description và Open Graph cho chia sẻ mạng xã hội",
+}
+
+
+class Option(BaseModel):
+    """One way to deliver the project, for the boss to compare."""
+
+    id: str = Field(description="Mã ngắn: A, B hoặc C")
+    tier: Tier
+    name: str = Field(description="Tên phương án, ví dụ Nhanh & rẻ")
+    summary: str
+    sections: list[Section] = Field(description="Các mục của trang theo phương án này, mục đầu là hero, có contact")
+    features: list[str] = Field(description="Mã tính năng chọn từ danh sách cho phép")
+    est_days: float = Field(description="Số ngày làm việc ước tính để bàn giao cho khách")
+    est_price_vnd: int = Field(description="Giá đề xuất báo khách, VND")
+    pros: list[str]
+    cons: list[str]
+
+
+class Proposal(BaseModel):
+    """Solution Architect output: 2-3 options and a recommendation."""
+
+    options: list[Option]
+    recommended: str = Field(description="id của phương án khuyên chọn")
+    reasoning: str = Field(description="Vì sao khuyên phương án đó, 1-2 câu")
+
+    def get(self, option_id: str) -> Option | None:
+        return next((o for o in self.options if o.id == option_id), None)
 
 
 class FileOut(BaseModel):

@@ -63,6 +63,13 @@ class CostTracker:
             self.spent_usd += cost
             self.by_agent[agent] = self.by_agent.get(agent, 0.0) + cost
 
+    @classmethod
+    def from_dict(cls, d: dict, budget_usd: float) -> "CostTracker":
+        """Resume spending from an earlier half of the same project."""
+        return cls(budget_usd=budget_usd, spent_usd=d.get("spent_usd", 0.0), calls=d.get("calls", 0),
+                   input_tokens=d.get("input_tokens", 0), output_tokens=d.get("output_tokens", 0),
+                   by_agent=dict(d.get("by_agent", {})))
+
     def to_dict(self) -> dict:
         return {
             "budget_usd": self.budget_usd,

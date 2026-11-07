@@ -1,7 +1,7 @@
 const $ = (s) => document.querySelector(s);
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 const STATUS = {
-  running: "Đang chạy", awaiting_approval: "Chờ sếp duyệt", needs_review: "Cần sếp xử lý",
+  running: "Đang chạy", awaiting_choice: "Chờ sếp chọn phương án", awaiting_approval: "Chờ sếp duyệt", needs_review: "Cần sếp xử lý",
   over_budget: "Chạm trần ngân sách", failed: "Lỗi", approved: "Đã duyệt", changes_requested: "Yêu cầu sửa",
 };
 let current = null;
@@ -21,6 +21,41 @@ async function loadList() {
     || '<li class="muted">Chưa có dự án</li>';
 }
 
+const vnd = (n) => Number(n).toLocaleString("vi-VN") + " ₫";
+const TIER = { fast: "Nhanh & rẻ", balanced: "Cân bằng", premium: "Cao cấp" };
+const FEAT = {
+  responsive: "Responsive", sticky_nav: "Menu dính", dark_mode: "Giao diện tối", animations: "Hiệu ứng",
+  faq_accordion: "Hỏi đáp", contact_form: "Form liên hệ", seo_meta: "SEO + chia sẻ MXH",
+};
+
+function renderOptions(p) {
+  const pr = p.artifacts.proposal;
+  const chosen = p.artifacts.choice?.option_id;
+  const waiting = p.status === "awaiting_choice";
+  const revisions = p.artifacts.revisions?.notes || [];
+  return `<section class="box"><h3>${waiting ? "Chọn phương án" : "Phương án"}</h3>
+    <p class="muted">${esc(pr.reasoning)}</p>
+    <div class="options">${pr.options.map((o) => `
+      <div class="opt ${o.id === pr.recommended ? "rec" : ""} ${o.id === chosen ? "chosen" : ""}">
+        <div class="opt-head"><b>${esc(o.id)}. ${esc(o.name)}</b>
+          ${o.id === pr.recommended ? '<span class="badge">Khuyên chọn</span>' : ""}
+          ${o.id === chosen ? '<span class="badge ok">Đã chọn</span>' : ""}</div>
+        <div class="price">${vnd(o.est_price_vnd)}</div>
+        <div class="muted small">${esc(o.est_days)} ngày · ${o.sections.length} mục · ${esc(TIER[o.tier] || o.tier)}</div>
+        <p>${esc(o.summary)}</p>
+        <div class="chips">${o.features.map((f) => `<span class="chip">${esc(FEAT[f] || f)}</span>`).join("")}</div>
+        <div class="small muted">Mục: ${o.sections.map((x) => esc(x.heading)).join(" · ")}</div>
+        <ul class="pc">${o.pros.map((x) => `<li class="pro">${esc(x)}</li>`).join("")}${o.cons.map((x) => `<li class="con">${esc(x)}</li>`).join("")}</ul>
+        ${waiting ? `<button data-choose="${esc(o.id)}">Chọn ${esc(o.id)}</button>` : ""}
+      </div>`).join("")}</div>
+    ${waiting ? `<form id="revise" class="revise">
+      <label for="note">Hoặc yêu cầu chỉnh lại các phương án</label>
+      <textarea id="note" rows="2" placeholder="Ví dụ: khách chỉ có 3 triệu, bỏ thư viện ảnh, thêm bảng giá"></textarea>
+      <button class="secondary" type="submit">Gửi góp ý</button></form>` : ""}
+    ${revisions.length ? `<p class="muted small">Đã chỉnh ${revisions.length} lần: ${revisions.map(esc).join(" · ")}</p>` : ""}
+  </section>`;
+}
+
 function list(items) { return `<ul>${(items || []).map((x) => `<li>${esc(x)}</li>`).join("")}</ul>`; }
 
 function render(p) {
@@ -33,6 +68,7 @@ function render(p) {
     <div class="board">${p.tasks.map((t) => `<div class="card"><div>${esc(t.label)}</div>
       <div class="s ${esc(t.status)}">${esc(t.status)}</div><div class="muted small">${esc(t.note)}</div></div>`).join("")}</div>`;
 
+  if (a.proposal && p.status === "awaiting_choice") html += renderOptions(p);
   if (a.report) {
     const r = a.report;
     html += `<section class="box"><h3>Báo cáo</h3><p>${esc(r.summary)}</p>
@@ -52,8 +88,9 @@ function render(p) {
       `<li><span class="${c.passed ? "done" : "failed"}">${c.passed ? "✓" : "✗"}</span> ${esc(c.name)}
        ${c.detail ? `<span class="muted small">: ${esc(c.detail)}</span>` : ""}</li>`).join("")}</ul></section>`;
   }
-  if (a.spec) {
-    const s = a.spec;
+  if (a.proposal && p.status !== "awaiting_choice") html += renderOptions(p);
+  if (a.final_spec || a.spec) {
+    const s = a.final_spec || a.spec;
     html += `<section class="box"><h3>Spec</h3><p><b>Mục tiêu:</b> ${esc(s.goal)}</p>
       <p><b>Đối tượng:</b> ${esc(s.audience)} · <b>Công nghệ:</b> ${esc(s.tech)}</p>
       <h4>Các mục</h4><ul>${s.sections.map((x) => `<li><code>#${esc(x.id)}</code> ${esc(x.heading)}: ${esc(x.purpose)}</li>`).join("")}</ul>
@@ -89,11 +126,30 @@ $("#projects").addEventListener("click", (e) => {
 });
 
 $("#detail").addEventListener("click", async (e) => {
+  const c = e.target.closest("[data-choose]");
+  if (c) {
+    c.disabled = true;
+    try {
+      await api(`/api/projects/${encodeURIComponent(current)}/choice`, { method: "POST", body: JSON.stringify({ option_id: c.dataset.choose }) });
+    } catch (err) { alert(err.message); }
+    return open(current);
+  }
   const b = e.target.closest("[data-decide]");
   if (!b) return;
   const approve = b.dataset.decide === "1";
   const note = approve ? "" : prompt("Cần sửa gì?") || "";
   await api(`/api/projects/${encodeURIComponent(current)}/decision`, { method: "POST", body: JSON.stringify({ approve, note }) });
+  open(current);
+});
+
+$("#detail").addEventListener("submit", async (e) => {
+  if (e.target.id !== "revise") return;
+  e.preventDefault();
+  const note = $("#note").value.trim();
+  if (!note) return;
+  try {
+    await api(`/api/projects/${encodeURIComponent(current)}/choice`, { method: "POST", body: JSON.stringify({ note }) });
+  } catch (err) { alert(err.message); }
   open(current);
 });
 

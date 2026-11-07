@@ -3,7 +3,8 @@
 POST /api/projects            start a project from a message
 GET  /api/projects            list projects
 GET  /api/projects/{id}       task board, artifacts, events, cost
-POST /api/projects/{id}/decision   approve / reject the delivery (human checkpoint)
+POST /api/projects/{id}/choice     pick an option, or send feedback to revise them (checkpoint 1)
+POST /api/projects/{id}/decision   approve / reject the delivery (checkpoint 2)
 GET  /preview/{id}/{path}     serve the generated site from the workspace
 """
 from __future__ import annotations
@@ -17,7 +18,7 @@ from fastapi.responses import FileResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from ai.orchestrator import run_project
+from ai.orchestrator import build_project, plan_project, revise_options
 
 ROOT = Path(__file__).resolve().parent.parent
 WORKSPACE = Path(os.environ.get("VTD_WORKSPACE", ROOT / "workspace" / "projects"))
@@ -35,6 +36,11 @@ class NewProject(BaseModel):
     budget_usd: float | None = Field(default=None, gt=0, le=100)
 
 
+class Choice(BaseModel):
+    option_id: str | None = Field(default=None, description="Chọn phương án này để thực thi")
+    note: str = Field(default="", max_length=2000, description="Góp ý để chỉnh lại các phương án")
+
+
 class Decision(BaseModel):
     approve: bool
     note: str = ""
@@ -44,9 +50,36 @@ class Decision(BaseModel):
 def create_project(body: NewProject) -> dict:
     budget = body.budget_usd or DEFAULT_BUDGET
     pid = store.create(body.message, budget)
-    threading.Thread(target=run_project, args=(pid, body.message, store, WORKSPACE, budget),
-                     daemon=True).start()
+    _bg(plan_project, pid, body.message, store, budget)
     return {"id": pid}
+
+
+def _bg(fn, *args) -> None:
+    threading.Thread(target=fn, args=args, daemon=True).start()
+
+
+@app.post("/api/projects/{pid}/choice")
+def choose(pid: str, body: Choice) -> dict:
+    p = store.get(pid)
+    if not p:
+        raise HTTPException(404, "Không tìm thấy dự án")
+    if p["status"] != "awaiting_choice":
+        raise HTTPException(409, f"Dự án đang ở trạng thái {p['status']}, không chờ chọn phương án")
+    if body.option_id:
+        proposal = p["artifacts"].get("proposal") or {}
+        if body.option_id not in {o["id"] for o in proposal.get("options", [])}:
+            raise HTTPException(400, f"Không có phương án {body.option_id}")
+        if not store.transition(pid, "awaiting_choice", "running"):
+            raise HTTPException(409, "Dự án vừa được xử lý")
+        store.event(pid, f"Sếp chọn phương án {body.option_id}")
+        _bg(build_project, pid, body.option_id, store, WORKSPACE, p["budget_usd"])
+        return {"status": "running", "action": "build"}
+    if not body.note.strip():
+        raise HTTPException(400, "Cần chọn một phương án hoặc ghi góp ý")
+    if not store.transition(pid, "awaiting_choice", "running"):
+        raise HTTPException(409, "Dự án vừa được xử lý")
+    _bg(revise_options, pid, body.note.strip(), store, p["budget_usd"])
+    return {"status": "running", "action": "revise"}
 
 
 @app.get("/api/projects")

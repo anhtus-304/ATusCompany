@@ -9,7 +9,7 @@ import json
 import time
 from pathlib import Path
 
-from .orchestrator import run_project
+from .orchestrator import build_project, plan_project
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -24,6 +24,9 @@ class PrintSink:
     def artifact(self, pid, name, data):
         self.artifacts[name] = data
 
+    def load(self, pid, name):
+        return self.artifacts.get(name)
+
     def event(self, pid, text):
         print(f"  · {text}")
 
@@ -36,12 +39,29 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("message")
     ap.add_argument("--budget", type=float, default=2.0)
+    ap.add_argument("--choose", default="ask", help="A/B/C, 'recommended', hoặc 'ask' để hỏi")
     ap.add_argument("--workspace", type=Path, default=ROOT / "workspace" / "projects")
     args = ap.parse_args()
 
     pid = time.strftime("cli-%Y%m%d-%H%M%S")
     sink = PrintSink()
-    run_project(pid, args.message, sink, args.workspace, args.budget)
+    if plan_project(pid, args.message, sink, args.budget) != "awaiting_choice":
+        return
+    proposal = sink.artifacts["proposal"]
+    print("\n=== Phương án ===")
+    for o in proposal["options"]:
+        star = " (khuyên chọn)" if o["id"] == proposal["recommended"] else ""
+        print(f"[{o['id']}] {o['name']}{star}: {o['est_days']:g} ngày, {o['est_price_vnd']:,} VND")
+        print(f"    {o['summary']}")
+        print(f"    + {'; '.join(o['pros'])}\n    - {'; '.join(o['cons'])}")
+    print(f"Lý do khuyên: {proposal['reasoning']}")
+    choice = args.choose
+    if choice == "ask":
+        choice = input(f"Chọn phương án [{proposal['recommended']}]: ").strip().upper() or "recommended"
+    if choice == "recommended":
+        choice = proposal["recommended"]
+    print()
+    build_project(pid, choice, sink, args.workspace, args.budget)
     report = sink.artifacts.get("report")
     if report:
         print("\n=== Báo cáo ===")
