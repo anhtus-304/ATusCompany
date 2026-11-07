@@ -1,0 +1,89 @@
+"""Backend tests. Run from the project root:  python -m unittest discover -s api"""
+import json
+import shutil
+import sys
+import tempfile
+import threading
+import unittest
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import server  # noqa: E402
+
+ENDPOINTS = server.ENDPOINTS
+
+
+def sample(fields):
+    values = {"email": "khach@example.com", "phone": "0901234567", "string": "Nguyễn Văn A", "text": "Xin chào"}
+    return {f["name"]: values[f["type"]] for f in fields}
+
+
+class ApiTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = Path(tempfile.mkdtemp())
+        server.DATA = cls.tmp
+        cls.srv = server.make_server(0)
+        cls.base = f"http://127.0.0.1:{cls.srv.server_port}"
+        threading.Thread(target=cls.srv.serve_forever, daemon=True).start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.srv.shutdown()
+        shutil.rmtree(cls.tmp, ignore_errors=True)
+
+    def post(self, path, data, as_json=True):
+        body = json.dumps(data).encode() if as_json else "&".join(f"{k}={v}" for k, v in data.items()).encode()
+        req = urllib.request.Request(self.base + path, data=body, method="POST", headers={
+            "Content-Type": "application/json" if as_json else "application/x-www-form-urlencoded"})
+        try:
+            with urllib.request.urlopen(req) as r:
+                return r.status, r.read()
+        except urllib.error.HTTPError as e:
+            return e.code, e.read()
+
+    def test_serves_index(self):
+        with urllib.request.urlopen(self.base + "/") as r:
+            self.assertEqual(r.status, 200)
+            self.assertIn(b"<!DOCTYPE html>", r.read())
+
+    def test_does_not_serve_api_source(self):
+        with self.assertRaises(urllib.error.HTTPError) as ctx:
+            urllib.request.urlopen(self.base + "/api/server.py")
+        self.assertEqual(ctx.exception.code, 404)
+
+    def test_valid_submission_is_stored(self):
+        for path, ep in ENDPOINTS.items():
+            status, _ = self.post(path, sample(ep["fields"]))
+            self.assertEqual(status, ep["success_status"])
+            lines = (self.tmp / ep["store"]).read_text(encoding="utf-8").strip().splitlines()
+            self.assertTrue(lines)
+
+    def test_missing_required_field_rejected(self):
+        for path, ep in ENDPOINTS.items():
+            data = sample(ep["fields"])
+            required = [f["name"] for f in ep["fields"] if f["required"]]
+            if required:
+                data.pop(required[0])
+                status, _ = self.post(path, data)
+                self.assertEqual(status, 400)
+
+    def test_too_long_rejected(self):
+        for path, ep in ENDPOINTS.items():
+            data = sample(ep["fields"])
+            f = ep["fields"][0]
+            data[f["name"]] = "x" * (f["max_length"] + 1)
+            self.assertEqual(self.post(path, data)[0], 400)
+
+    def test_oversized_body_rejected(self):
+        for path in ENDPOINTS:
+            self.assertEqual(self.post(path, {"x": "y" * 20000})[0], 413)
+
+    def test_unknown_endpoint(self):
+        self.assertEqual(self.post("/api/nope", {})[0], 404)
+
+
+if __name__ == "__main__":
+    unittest.main()

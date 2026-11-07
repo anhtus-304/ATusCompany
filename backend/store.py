@@ -73,6 +73,14 @@ class Store:
             "SELECT text, at FROM events WHERE project_id=? ORDER BY id", (pid,))]
         return p
 
+    def get_meta(self, pid: str) -> dict | None:
+        rows = self._x("SELECT id, title, status FROM projects WHERE id=?", (pid,))
+        return dict(rows[0]) if rows else None
+
+    def task_row(self, pid: str, stage: str) -> dict | None:
+        rows = self._x("SELECT rowid, label FROM tasks WHERE project_id=? AND stage=?", (pid, stage))
+        return dict(rows[0]) if rows else None
+
     def set_status(self, pid: str, status: str) -> None:
         self._x("UPDATE projects SET status=?, updated_at=? WHERE id=?", (status, time.time(), pid))
 

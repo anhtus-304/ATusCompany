@@ -13,7 +13,7 @@ from html.parser import HTMLParser
 from pathlib import Path
 
 from .artifacts import (
-    FEATURES, Brief, Check, CodeArtifact, FileOut, FinalReport, Option, Proposal, QAReport,
+    FEATURES, Brief, Check, CodeArtifact, DesignSpec, FileOut, FinalReport, Option, Proposal, QAReport,
     Section, Spec,
 )
 from .llm import LLM
@@ -228,67 +228,105 @@ def apply_option(spec: Spec, option: Option) -> Spec:
     final.features = list(option.features)
     if not final.meta_description:
         final.meta_description = spec.goal[:155]
+    if "contact_form" in final.features and not any(ep.path == "/api/contact" for ep in final.api):
+        from .team import contact_endpoint
+        final.api.append(contact_endpoint())
     final.acceptance_criteria = default_criteria() + [
         f"Tính năng: {FEATURES[f]}" for f in option.features]
+    if final.api:
+        final.acceptance_criteria += [
+            "Backend có test tự động và tất cả đều đạt",
+            *(f"{ep.method} {ep.path} đúng contract: dữ liệu hợp lệ trả {ep.success_status}, thiếu trường bắt buộc trả 400"
+              for ep in final.api),
+            "Reviewer không còn lỗi mức blocker/major",
+        ]
     return final
 
 # --------------------------------------------------------------------------- Frontend Dev
 
 def frontend_dev(llm: LLM, spec: Spec, ws: RoleView, qa_failures: list[Check] | None = None,
-                 previous: CodeArtifact | None = None) -> CodeArtifact:
+                 previous: CodeArtifact | None = None, design: DesignSpec | None = None) -> CodeArtifact:
     user = f"Spec:\n{spec.model_dump_json(indent=2)}"
+    if design:
+        user += f"\n\nDesign spec:\n{design.model_dump_json(indent=2)}"
     if qa_failures:
-        user += "\n\nLỗi QA cần sửa:\n" + "\n".join(f"- {c.name}: {c.detail}" for c in qa_failures)
+        user += "\n\nLỗi cần sửa:\n" + "\n".join(f"- {c.name}: {c.detail}" for c in qa_failures)
         if previous:
             user += "\n\nCode lần trước:\n" + "\n\n".join(
                 f"=== {f.path} ===\n{f.content}" for f in previous.files)
     out = llm.structured("frontend_dev", prompt("frontend_dev"), user, CodeArtifact)
     if out is None:
-        out = _render_template(spec)
+        out = _render_template(spec, design)
     for f in out.files:
         ws.write(f.path, f.content)
     return out
 
 
-def _render_template(spec: Spec) -> CodeArtifact:
+def _render_template(spec: Spec, design: DesignSpec | None = None) -> CodeArtifact:
     e = html.escape
     f = set(spec.features)
-    bg, accent, light, dark = (spec.palette + ["#333", "#c80", "#fafafa", "#111"])[:4]
+    pal = spec.palette + ["#3b2a20", "#a8652f", "#f6efe7", "#1f1a17"]
+    c = (design.colors if design else
+         {"brand": pal[0], "accent": pal[1], "surface": pal[2], "ink": pal[3], "muted": "#5c5047"})
+    dark = (design.dark_colors if design and design.dark_colors else
+            {"brand": "#e9d8c4", "accent": "#d9a26b", "surface": "#171310", "ink": "#efe6dc", "muted": "#b9ab9c"})
+    font = design.font_stack if design else 'system-ui, -apple-system, "Segoe UI", sans-serif'
+    radius = design.radius_px if design else 10
+    width = design.max_width_px if design else 1040
+    layout = {d.id: d.layout for d in design.sections} if design else {}
+    api = {ep.path: ep for ep in spec.api}
+
+    def form_html() -> str:
+        ep = api.get("/api/contact")
+        if not ep:
+            return ""
+        labels = {"name": "Họ tên", "phone": "Số điện thoại", "email": "Email", "message": "Lời nhắn"}
+        types = {"phone": "tel", "email": "email", "string": "text"}
+        rows = []
+        for fld in ep.fields:
+            req = " required" if fld.required else ""
+            label = labels.get(fld.name, fld.name)
+            if fld.type == "text":
+                ctl = f'<textarea name="{fld.name}" rows="3" maxlength="{fld.max_length}"{req}></textarea>'
+            else:
+                ctl = f'<input name="{fld.name}" type="{types[fld.type]}" maxlength="{fld.max_length}"{req}>'
+            rows.append(f"<label>{e(label)}{ctl}</label>")
+        return ('\n    <form class="form" action="api/contact" method="post">' + "".join(rows)
+                + '<button type="submit">Gửi</button></form>'
+                  '\n    <p id="sent" class="sent" role="status">Đã nhận lời nhắn, chúng tôi sẽ liên hệ sớm.</p>')
+
     blocks = []
     for i, sec in enumerate(spec.sections):
-        items = "".join(f"<li>{e(c)}</li>" for c in sec.content)
-        reveal = ' class="reveal"' if "animations" in f else ""
+        items = "".join(f"<li>{e(x)}</li>" for x in sec.content)
+        cls = " reveal" if "animations" in f else ""
+        lay = layout.get(sec.id, "grid")
         if i == 0:
             blocks.append(
                 f'<section id="{sec.id}" class="hero">\n  <div class="wrap">\n'
                 f"    <h1>{e(sec.heading)}</h1>\n    <p class=\"lead\">{e(sec.content[0] if sec.content else sec.purpose)}</p>\n"
                 f'    <a class="cta" href="#contact">{e(spec.cta_text)}</a>\n  </div>\n</section>')
         elif sec.id == "faq" and "faq_accordion" in f:
-            qs = "".join(f"<details><summary>{e(c)}</summary><p>[Câu trả lời]</p></details>" for c in sec.content)
-            blocks.append(f'<section id="{sec.id}"{reveal}>\n  <div class="wrap">\n    <h2>{e(sec.heading)}</h2>\n'
+            qs = "".join(f"<details><summary>{e(x)}</summary><p>[Câu trả lời]</p></details>" for x in sec.content)
+            blocks.append(f'<section id="{sec.id}" class="{cls.strip()}">\n  <div class="wrap">\n    <h2>{e(sec.heading)}</h2>\n'
                           f"    {qs}\n  </div>\n</section>")
         elif sec.id == "contact":
-            form = ""
-            if "contact_form" in f:
-                form = ('\n    <form class="form" action="mailto:[email@khach.vn]" method="post" enctype="text/plain">'
-                        '<label>Họ tên<input name="name" required></label>'
-                        '<label>Số điện thoại<input name="phone" type="tel" required></label>'
-                        '<label>Lời nhắn<textarea name="message" rows="3"></textarea></label>'
-                        '<button type="submit">Gửi</button></form>')
             blocks.append(
-                f'<section id="{sec.id}"{reveal}>\n  <div class="wrap">\n    <h2>{e(sec.heading)}</h2>\n'
-                f"    <ul>{items}</ul>{form}\n"
+                f'<section id="{sec.id}" class="{cls.strip()}">\n  <div class="wrap">\n    <h2>{e(sec.heading)}</h2>\n'
+                f"    <ul>{items}</ul>{form_html() if 'contact_form' in f else ''}\n"
                 f'    <a class="cta" href="#contact">{e(spec.cta_text)}</a>\n  </div>\n</section>')
         else:
+            ul = {"grid": "grid", "split": "split", "list": "plain"}.get(lay, "grid")
             blocks.append(
-                f'<section id="{sec.id}"{reveal}>\n  <div class="wrap">\n    <h2>{e(sec.heading)}</h2>\n'
-                f"    <ul class=\"grid\">{items}</ul>\n  </div>\n</section>")
+                f'<section id="{sec.id}" class="{cls.strip()}">\n  <div class="wrap">\n    <h2>{e(sec.heading)}</h2>\n'
+                f'    <ul class="{ul}">{items}</ul>\n  </div>\n</section>')
+    blocks = [b.replace(' class=""', "") for b in blocks]
     nav = "".join(f'<a href="#{s.id}">{e(s.heading)}</a>' for s in spec.sections[1:])
     seo = ""
     if "seo_meta" in f:
-        seo = (f'\n<meta name="description" content="{e(spec.meta_description or spec.goal[:155])}">'
+        desc = e(spec.meta_description or spec.goal[:155])
+        seo = (f'\n<meta name="description" content="{desc}">'
                f'\n<meta property="og:title" content="{e(spec.page_title)}">'
-               f'\n<meta property="og:description" content="{e(spec.meta_description or spec.goal[:155])}">')
+               f'\n<meta property="og:description" content="{desc}">')
     page = f"""<!DOCTYPE html>
 <html lang="{e(spec.language)}">
 <head>
@@ -306,38 +344,45 @@ def _render_template(spec: Spec) -> CodeArtifact:
 </body>
 </html>
 """
-    css = f""":root {{ --bg: {bg}; --accent: {accent}; --light: {light}; --dark: {dark}; --card: #fff; --on-brand: {light}; --ink: {dark}; }}
+    on_brand = "#f6efe7"
+    css = f""":root {{ --brand: {c['brand']}; --accent: {c['accent']}; --surface: {c['surface']}; --ink: {c['ink']}; --muted: {c['muted']}; --card: #ffffff; --on-brand: {on_brand}; --radius: {radius}px; }}
 * {{ box-sizing: border-box; }}
-body {{ margin: 0; font-family: system-ui, -apple-system, "Segoe UI", sans-serif; color: var(--dark); background: var(--light); line-height: 1.6; }}
-.wrap {{ max-width: 1040px; margin: 0 auto; padding: 0 16px; }}
-.top {{ {"position: sticky; top: 0; z-index: 1; " if "sticky_nav" in f else ""}background: var(--bg); color: var(--on-brand); padding: 12px 0; }}
+body {{ margin: 0; font-family: {font}; font-size: 16px; color: var(--ink); background: var(--surface); line-height: 1.6; }}
+.wrap {{ max-width: {width}px; margin: 0 auto; padding: 0 16px; }}
+.top {{ {"position: sticky; top: 0; z-index: 1; " if "sticky_nav" in f else ""}background: var(--brand); color: var(--on-brand); padding: 12px 0; }}
 .top .wrap {{ display: flex; justify-content: space-between; align-items: center; gap: 12px; flex-wrap: wrap; }}
 .top nav a {{ color: var(--on-brand); margin-left: 16px; text-decoration: none; font-size: 14px; }}
 section {{ padding: 64px 0; }}
 section:nth-child(even) {{ background: var(--card); }}
-.hero {{ background: var(--bg); color: var(--on-brand); padding: 96px 0; text-align: center; }}
+.hero {{ background: var(--brand); color: var(--on-brand); padding: 96px 0; text-align: center; }}
 .hero h1 {{ font-size: clamp(2rem, 6vw, 3.5rem); margin: 0 0 16px; }}
 .lead {{ font-size: 1.2rem; max-width: 640px; margin: 0 auto 32px; }}
 h2 {{ font-size: 1.8rem; margin-top: 0; }}
 ul {{ padding-left: 20px; }}
-.grid {{ list-style: none; padding: 0; display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 16px; }}
-.grid li {{ background: var(--light); border-left: 4px solid var(--accent); padding: 16px; border-radius: 8px; }}
+.grid, .split {{ list-style: none; padding: 0; display: grid; gap: 16px; }}
+.grid {{ grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); }}
+.split {{ grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); }}
+.grid li, .split li {{ background: var(--surface); border-left: 4px solid var(--accent); padding: 16px; border-radius: var(--radius); }}
+.plain li {{ margin-bottom: 6px; }}
 .cta {{ display: inline-block; background: var(--accent); color: #fff; padding: 14px 28px; border-radius: 999px; text-decoration: none; font-weight: 600; }}
 .cta:hover {{ filter: brightness(1.1); }}
-details {{ background: var(--light); border-radius: 8px; padding: 12px 16px; margin-bottom: 8px; }}
+a:focus-visible, button:focus-visible, input:focus-visible, textarea:focus-visible, summary:focus-visible {{ outline: 3px solid var(--accent); outline-offset: 2px; }}
+details {{ background: var(--surface); border-radius: var(--radius); padding: 12px 16px; margin-bottom: 8px; }}
 summary {{ font-weight: 600; cursor: pointer; }}
 .form {{ display: grid; gap: 12px; max-width: 480px; margin: 16px 0 24px; }}
 .form label {{ display: grid; gap: 4px; font-weight: 600; }}
-.form input, .form textarea {{ font: inherit; padding: 10px; border: 1px solid #ccc; border-radius: 8px; }}
-.form button {{ justify-self: start; background: var(--dark); color: var(--light); border: 0; padding: 10px 20px; border-radius: 8px; font: inherit; }}
-footer {{ background: var(--ink); color: var(--on-brand); padding: 24px 0; font-size: 14px; }}
+.form input, .form textarea {{ font: inherit; padding: 10px; border: 1px solid var(--muted); border-radius: var(--radius); background: var(--card); color: var(--ink); }}
+.form button {{ justify-self: start; background: var(--ink); color: var(--surface); border: 0; padding: 10px 20px; border-radius: var(--radius); font: inherit; cursor: pointer; }}
+.sent {{ display: none; color: var(--accent); font-weight: 600; }}
+.sent:target {{ display: block; }}
+footer {{ background: var(--ink); color: var(--surface); padding: 24px 0; font-size: 14px; }}
 """
     if "responsive" in f:
         css += "@media (max-width: 600px) { .top nav { display: none; } section { padding: 48px 0; } }\n"
     if "dark_mode" in f:
         css += ("@media (prefers-color-scheme: dark) {\n"
-                "  :root { --light: #171310; --dark: #efe6dc; --card: #211b16; }\n"
-                "  .form input, .form textarea { background: #211b16; color: var(--dark); border-color: #3a3029; }\n}\n")
+                f"  :root {{ --surface: {dark['surface']}; --ink: {dark['ink']}; --muted: {dark['muted']}; --card: #211b16; }}\n"
+                "  footer { background: #0d0b09; color: var(--ink); }\n}\n")
     if "animations" in f:
         css += ("@keyframes rise { from { opacity: 0; transform: translateY(16px); } to { opacity: 1; transform: none; } }\n"
                 ".reveal { animation: rise .7s ease-out both; }\n"
@@ -404,8 +449,8 @@ def _feature_checks(spec: Spec, ws: RoleView, src: str, tags: list[tuple[str, di
                        "Thiếu @keyframes hoặc chưa tôn trọng prefers-reduced-motion"),
         "faq_accordion": (bool(re.search(r'<section[^>]*id="faq".*?<details', src, re.S)),
                           "Mục #faq không dùng <details>"),
-        "contact_form": (bool(re.search(r'<section[^>]*id="contact".*?<form[^>]*action="mailto:', src, re.S)),
-                         "Mục #contact không có <form action=\"mailto:...\">"),
+        "contact_form": (bool(re.search(r'<section[^>]*id="contact".*?<form[^>]*action="/?api/contact"[^>]*method="post"', src, re.S | re.I)),
+                         "Mục #contact không có <form action=\"api/contact\" method=\"post\">"),
         "seo_meta": (meta("name", "description") and meta("property", "og:title"),
                      "Thiếu meta description hoặc og:title"),
     }
@@ -471,6 +516,16 @@ def qa(spec: Spec, ws: RoleView) -> QAReport:
     for name, ok, detail in _feature_checks(spec, ws, src, tags):
         add(name, ok, detail)
 
+    for ep in spec.api:
+        if ep.method != "POST" or ep.path != "/api/contact" or "contact_form" not in spec.features:
+            continue
+        controls = {a.get("name"): a for t, a in tags if t in ("input", "textarea", "select") and a.get("name")}
+        missing = [fl.name for fl in ep.fields if fl.name not in controls]
+        not_req = [fl.name for fl in ep.fields if fl.required and fl.name in controls
+                   and "required" not in controls[fl.name]]
+        add("Form khớp API contract", not missing and not not_req,
+            f"Thiếu ô: {missing}; ô bắt buộc chưa có required: {not_req}")
+
     size = sum(len(ws.read(f).encode()) for f in ws.list_files())
     add("Tổng dung lượng < 300KB", size < 300_000, f"Tổng {size} byte")
 
@@ -480,13 +535,15 @@ def qa(spec: Spec, ws: RoleView) -> QAReport:
 # --------------------------------------------------------------------------- Reporter
 
 def reporter(llm: LLM, brief: Brief, spec: Spec, qa_report: QAReport, fix_rounds: int,
-             cost: dict, escalated: bool, option: Option | None = None) -> FinalReport:
+             cost: dict, escalated: bool, option: Option | None = None,
+             review: "ReviewReport | None" = None) -> FinalReport:
     chosen = (f"Phương án sếp chọn: {option.id} - {option.name}, {option.est_days} ngày, "
               f"{option.est_price_vnd:,} VND, tính năng: {', '.join(option.features)}\n\n") if option else ""
     user = (f"Brief:\n{brief.model_dump_json(indent=2)}\n\n{chosen}Spec (rút gọn): {spec.project_name}, "
             f"{len(spec.sections)} mục: {', '.join(s.id for s in spec.sections)}\n\n"
             f"QA:\n{qa_report.model_dump_json(indent=2)}\n\nSố vòng sửa lỗi: {fix_rounds}\n"
-            f"Đã vượt ngưỡng sửa lỗi tự động: {escalated}\nChi phí: {cost}")
+            f"Đã vượt ngưỡng sửa lỗi tự động: {escalated}\nChi phí: {cost}"
+            + (f"\n\nReview:\n{review.model_dump_json(indent=2)}" if review else ""))
     out = llm.structured("reporter", prompt("reporter"), user, FinalReport)
     if out is not None:
         return out
@@ -498,6 +555,15 @@ def reporter(llm: LLM, brief: Brief, spec: Spec, qa_report: QAReport, fix_rounds
     if not qa_report.passed:
         remaining.insert(0, "Sửa các lỗi QA còn lại: " + "; ".join(c.name for c in qa_report.failures()))
     risks = ["Nội dung do AI viết, cần người kiểm tra trước khi gửi khách"]
+    if review:
+        blocking = review.blocking()
+        minors = [f for f in review.findings if f.severity == "minor"]
+        if blocking:
+            risks.insert(0, "Reviewer còn lỗi chưa sửa: " + "; ".join(f"{f.file}: {f.message}" for f in blocking))
+        if minors:
+            remaining.append("Gợi ý từ Reviewer: " + "; ".join(f"{f.file}: {f.message}" for f in minors))
+    if spec.api:
+        risks.append("Backend lưu dữ liệu khách vào file trên máy chủ, cần chọn hosting có backup trước khi chạy thật")
     if escalated:
         risks.insert(0, "Đã hết số lần sửa lỗi tự động, cần người xử lý")
     return FinalReport(
@@ -507,9 +573,14 @@ def reporter(llm: LLM, brief: Brief, spec: Spec, qa_report: QAReport, fix_rounds
         done=["Tiếp nhận và chuẩn hóa yêu cầu", "Viết spec và tiêu chí nghiệm thu",
               *([f"Sếp chọn phương án {option.id}: {option.est_days:g} ngày, báo khách {option.est_price_vnd:,} VND"]
                 if option else []),
-              "Code index.html + styles.css, commit vào repo dự án", f"QA {passed}/{total} kiểm tra đạt"],
+              "UI/UX Designer lập design spec (màu, font, bố cục từng mục)",
+              *(["Backend Dev viết API " + ", ".join(ep.path for ep in spec.api) + " kèm test"] if spec.api else []),
+              "Frontend Dev code index.html + styles.css, commit vào repo dự án",
+              f"QA {passed}/{total} kiểm tra đạt",
+              *([f"Reviewer: {len(review.blocking())} lỗi chặn, {len(review.findings)} ghi chú"] if review else [])],
         remaining=remaining,
         risks=risks,
         decisions_needed=["Duyệt gửi bản demo cho khách", "Duyệt deploy lên hosting"]
+        + (["Chọn nơi lưu dữ liệu khách (file hiện tại, Google Sheet, hay CRM)"] if spec.api else [])
         + brief.open_questions,
     )

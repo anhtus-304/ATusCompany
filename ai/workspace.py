@@ -9,7 +9,16 @@ from __future__ import annotations
 import subprocess
 from pathlib import Path
 
-ROLE_CAN_WRITE = {"frontend_dev"}
+def _frontend_path(rel: str) -> bool:
+    return not rel.startswith(("api/", "design/", ".")) and rel.endswith((".html", ".css", ".svg", ".png", ".jpg", ".webp", ".ico"))
+
+
+# Least privilege: each role may only write its own part of the project.
+ROLE_WRITE_RULES = {
+    "designer": lambda rel: rel.startswith("design/"),
+    "frontend_dev": _frontend_path,
+    "backend_dev": lambda rel: rel.startswith("api/") and not rel.startswith("api/data/"),
+}
 
 
 class PermissionDenied(PermissionError):
@@ -22,7 +31,7 @@ class Workspace:
         self.dir.mkdir(parents=True, exist_ok=True)
         if not (self.dir / ".git").exists():
             self._git("init", "-q", "-b", "main")
-            (self.dir / ".gitignore").write_text(".vtd/\n")
+            (self.dir / ".gitignore").write_text(".vtd/\napi/data/\n__pycache__/\n")
 
     def _git(self, *args: str) -> str:
         out = subprocess.run(
@@ -77,8 +86,10 @@ class RoleView:
         )
 
     def write(self, rel: str, content: str) -> None:
-        if self.role not in ROLE_CAN_WRITE:
-            raise PermissionDenied(f"Vai trò {self.role} không được ghi code")
         p = self._ws.resolve(rel)
+        rel = str(p.relative_to(self._ws.dir))
+        rule = ROLE_WRITE_RULES.get(self.role)
+        if rule is None or not rule(rel):
+            raise PermissionDenied(f"Vai trò {self.role} không được ghi {rel}")
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(content, encoding="utf-8")

@@ -56,3 +56,4 @@ iframe { width: 100%; height: 520px; border: 1px solid var(--line); border-radiu
 .revise { display: grid; gap: 8px; margin-top: 8px; }
 .revise label { margin: 0; }
 .revise button { justify-self: start; }
+.sw { display: inline-block; width: 10px; height: 10px; border-radius: 3px; margin-right: 4px; vertical-align: middle; border: 1px solid var(--line); }

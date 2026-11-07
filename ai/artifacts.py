@@ -32,6 +32,23 @@ class Section(BaseModel):
     content: list[str] = Field(description="Các ý nội dung cụ thể sẽ xuất hiện trong mục")
 
 
+class ApiField(BaseModel):
+    name: str
+    type: Literal["string", "email", "phone", "text"]
+    required: bool
+    max_length: int = 500
+
+
+class ApiEndpoint(BaseModel):
+    """Contract the Architect fixes so Frontend and Backend can work in parallel."""
+
+    method: Literal["GET", "POST"]
+    path: str = Field(description="Đường dẫn, ví dụ /api/contact")
+    purpose: str
+    fields: list[ApiField] = Field(default_factory=list)
+    success_status: int = 201
+
+
 class Spec(BaseModel):
     """Business Analyst + Architect output."""
 
@@ -48,6 +65,28 @@ class Spec(BaseModel):
     features: list[str] = Field(default_factory=list,
                                 description="Mã tính năng, được điền sau khi sếp chọn phương án")
     meta_description: str = Field(default="", description="Mô tả ngắn cho SEO, 1 câu")
+    api: list[ApiEndpoint] = Field(default_factory=list, description="API backend, rỗng nếu trang tĩnh")
+
+
+Layout = Literal["hero", "grid", "list", "split", "faq", "form"]
+
+
+class SectionDesign(BaseModel):
+    id: str
+    layout: Layout
+    note: str = ""
+
+
+class DesignSpec(BaseModel):
+    """UI/UX Designer output, consumed by the Frontend Dev."""
+
+    colors: dict[str, str] = Field(description="Token màu: brand, accent, surface, ink, muted (hex)")
+    dark_colors: dict[str, str] = Field(default_factory=dict, description="Token màu cho giao diện tối")
+    font_stack: str
+    radius_px: int
+    max_width_px: int
+    sections: list[SectionDesign]
+    notes: list[str] = Field(description="Ghi chú thiết kế cho Frontend Dev")
 
 
 Tier = Literal["fast", "balanced", "premium"]
@@ -59,7 +98,7 @@ FEATURES = {
     "dark_mode": "Tự đổi giao diện tối theo máy người xem",
     "animations": "Hiệu ứng xuất hiện nhẹ khi cuộn (CSS)",
     "faq_accordion": "Mục hỏi đáp dạng mở/đóng",
-    "contact_form": "Form liên hệ gửi qua email (mailto)",
+    "contact_form": "Form liên hệ lưu vào hệ thống (có backend API)",
     "seo_meta": "Meta description và Open Graph cho chia sẻ mạng xã hội",
 }
 
@@ -102,10 +141,14 @@ class CodeArtifact(BaseModel):
     notes: str = Field(description="Ghi chú ngắn cho QA / trưởng phòng")
 
 
+Owner = Literal["frontend_dev", "backend_dev"]
+
+
 class Check(BaseModel):
     name: str
     passed: bool
     detail: str = ""
+    owner: Owner = "frontend_dev"
 
 
 class QAReport(BaseModel):
@@ -114,6 +157,27 @@ class QAReport(BaseModel):
 
     def failures(self) -> list[Check]:
         return [c for c in self.checks if not c.passed]
+
+
+class Finding(BaseModel):
+    severity: Literal["blocker", "major", "minor"]
+    owner: Owner
+    file: str
+    rule: str
+    message: str
+
+
+class ReviewReport(BaseModel):
+    """Reviewer output. Blockers and majors go back to the owning dev."""
+
+    findings: list[Finding]
+
+    @property
+    def passed(self) -> bool:
+        return not any(f.severity in ("blocker", "major") for f in self.findings)
+
+    def blocking(self) -> list[Finding]:
+        return [f for f in self.findings if f.severity in ("blocker", "major")]
 
 
 class FinalReport(BaseModel):
