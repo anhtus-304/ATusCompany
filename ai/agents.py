@@ -13,7 +13,7 @@ from html.parser import HTMLParser
 from pathlib import Path
 
 from .artifacts import (
-    FEATURES, Brief, Check, ClientMemory, CodeArtifact, DesignSpec, FileOut, FinalReport, Option, Proposal, QAReport,
+    FEATURES, Brief, Check, ClientMemory, ClientMessage, CodeArtifact, DesignSpec, FileOut, FinalReport, Option, Proposal, QAReport,
     Section, Spec,
 )
 from .llm import LLM
@@ -618,3 +618,47 @@ def reporter(llm: LLM, brief: Brief, spec: Spec, qa_report: QAReport, fix_rounds
         + (["Chọn nơi lưu dữ liệu khách (file hiện tại, Google Sheet, hay CRM)"] if spec.api else [])
         + brief.open_questions,
     )
+
+
+# How each feature is described to a client: what it does for them, not how it is built.
+CLIENT_FEATURES = {
+    "responsive": "hiển thị đẹp trên điện thoại",
+    "sticky_nav": "menu luôn hiện khi cuộn trang",
+    "dark_mode": "tự đổi giao diện tối theo máy người xem",
+    "animations": "hiệu ứng nhẹ khi cuộn",
+    "faq_accordion": "mục hỏi đáp",
+    "contact_form": "form liên hệ, thông tin khách để lại được lưu lại cho anh/chị",
+    "seo_meta": "tối ưu cho Google và khi chia sẻ lên mạng xã hội",
+}
+
+
+def client_message(llm: LLM, brief: Brief, spec: Spec, option: Option | None, report: FinalReport,
+                   links: dict[str, str], client_name: str) -> ClientMessage:
+    """Draft the hand-over email. Gets only what the client may see: no cost, QA or review internals."""
+    link_lines = "\n".join(f"- {k}: {v}" for k, v in links.items()) or "- (chưa có link)"
+    chosen = (f"Phương án đã chốt: {option.name}, {option.est_days:g} ngày, {option.est_price_vnd:,} VND, "
+              f"tính năng: {', '.join(CLIENT_FEATURES.get(f, f) for f in option.features)}\n") if option else ""
+    user = (f"Khách: {client_name}\nNgôn ngữ trang: {brief.language}\nMục tiêu: {brief.goal}\n{chosen}"
+            f"Các mục của trang: {', '.join(s.heading for s in spec.sections)}\n"
+            f"Câu hỏi còn mở với khách: {'; '.join(brief.open_questions) or 'không'}\n"
+            f"Link:\n{link_lines}")
+    out = llm.structured("reporter", prompt("client_message"), user, ClientMessage)
+    if out is not None:
+        return out
+
+    link = links.get("Bản chạy thật") or links.get("Bản demo") or ""
+    todo = ["Gửi ảnh thật và logo để thay ảnh minh họa",
+            "Xem lại các nội dung trong ngoặc vuông [..] và gửi thông tin chính xác (địa chỉ, số điện thoại, giờ mở cửa)"]
+    todo += [q for q in brief.open_questions if not re.search(r"logo|ảnh|địa chỉ|điện thoại", q, re.I)][:3]
+    lines = [f"Chào anh/chị {client_name},", "",
+             f"Bên em đã hoàn thành bản demo landing page {spec.project_name}"
+             + (f" theo phương án {option.name}" if option else "") + ".",
+             "Trang gồm các mục: " + ", ".join(s.heading for s in spec.sections) + "."]
+    if option and option.features:
+        lines.append("Trang có " + ", ".join(CLIENT_FEATURES.get(f, FEATURES.get(f, f)) for f in option.features) + ".")
+    if link:
+        lines += ["", f"Anh/chị xem trang tại: {link}"]
+    lines += ["", "Để hoàn thiện, anh/chị giúp bên em:", *[f"- {t}" for t in todo], "",
+              "Anh/chị xem và phản hồi giúp em, bên em sẽ chỉnh theo góp ý.", "", "Trân trọng."]
+    return ClientMessage(subject=f"Bàn giao bản demo landing page {spec.project_name}", body="\n".join(lines))
+

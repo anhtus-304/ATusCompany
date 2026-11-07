@@ -8,6 +8,8 @@ build_project:  chosen option -> final spec (+ API contract)
                 -> QA || Reviewer                   (parallel: both read-only)
                 -> failures routed to the owning dev, up to MAX_FIX_ROUNDS
                 -> report                           -> pause "awaiting_approval"
+resume_project: after the boss approves more budget for a run that hit the ceiling
+                ("over_budget"), re-run the half that stopped, reusing finished artifacts.
 
 The orchestrator owns sequencing and the task board. Agents only see the
 artifacts they need. QA and review failures go back to the dev who owns the
@@ -31,6 +33,7 @@ from .workspace import Workspace
 
 MAX_FIX_ROUNDS = int(os.environ.get("VTD_MAX_FIX_ROUNDS", "2"))
 MAX_REVISIONS = int(os.environ.get("VTD_MAX_REVISIONS", "3"))
+BUDGET_WARN_AT = 0.8
 
 STAGES = [
     ("intake", "Lễ tân"),
@@ -74,6 +77,7 @@ class _Run:
         self.llm = llm_factory(self.cost)
         self.stage = "intake"
         self.status: str | None = None
+        self.resume: dict = {}  # how to restart this half if it hits the budget ceiling
         self._started: dict[str, float] = {}
 
     def metric(self, agent: str, name: str, value: float) -> None:
@@ -88,6 +92,15 @@ class _Run:
         elif status in ("done", "failed", "blocked") and stage in self._started:
             self.metric(stage, "seconds", time.monotonic() - self._started.pop(stage))
         self.sink.task(self.pid, stage, status, note)
+        self._warn_budget()
+
+    def _warn_budget(self) -> None:
+        """Tell the boss once when a project has used most of its budget, before it stops."""
+        c = self.cost
+        if c.budget_usd and c.spent_usd >= BUDGET_WARN_AT * c.budget_usd and not self.sink.load(self.pid, "budget_warning"):
+            self.save("budget_warning", {"spent_usd": round(c.spent_usd, 6), "budget_usd": c.budget_usd})
+            self.sink.event(self.pid, f"Cảnh báo: đã dùng {c.spent_usd / c.budget_usd:.0%} ngân sách "
+                                      f"(${c.spent_usd:.4f} / ${c.budget_usd:.2f})")
 
     def save(self, name: str, data: dict) -> None:
         self.sink.artifact(self.pid, name, data)
@@ -107,8 +120,10 @@ class _Run:
         try:
             yield self
         except BudgetExceeded as e:
-            self.step(self.stage, "blocked", str(e))
-            self.sink.event(self.pid, f"Dừng vì chạm trần ngân sách: {e}")
+            self.step(self.stage, "blocked", f"chạm trần ngân sách, chờ sếp duyệt chi thêm: {e}")
+            self.save("budget_stop", {**self.resume, "stage": self.stage,
+                                      "spent_usd": round(self.cost.spent_usd, 6), "budget_usd": self.cost.budget_usd})
+            self.sink.event(self.pid, f"Dừng vì chạm trần ngân sách: {e}. Chờ sếp duyệt chi thêm hoặc dừng dự án")
             self.end("over_budget")
         except Exception as e:  # noqa: BLE001 - surface any agent failure on the board
             self.step(self.stage, "failed", f"{type(e).__name__}: {e}")
@@ -126,23 +141,33 @@ def _propose(r: _Run, brief: Brief, spec: Spec, note: str = "", previous: Propos
 
 
 def plan_project(pid: str, message: str, sink: Sink, budget_usd: float = 2.0,
-                 llm_factory: LLMFactory = make_llm) -> str:
+                 llm_factory: LLMFactory = make_llm, resume: bool = False) -> str:
     r = _Run(pid, sink, budget_usd, llm_factory)
-    sink.event(pid, f"Bắt đầu dự án, model: {r.llm.name}, trần ngân sách ${budget_usd:.2f}")
+    r.resume = {"half": "plan", "message": message}
+    if not resume:
+        sink.event(pid, f"Bắt đầu dự án, model: {r.llm.name}, trần ngân sách ${budget_usd:.2f}")
     with r.guard():
-        r.step("intake", "running")
-        memory = _memory(sink, pid)
-        if memory and memory.is_returning:
-            sink.event(pid, f"Khách quen {memory.client_name}: {len(memory.projects)} dự án trước, "
-                            f"{len(memory.decisions)} quyết định đã chốt")
-        brief = agents.intake(r.llm, message, memory)
-        r.save("brief", brief.model_dump())
-        r.step("intake", "done", f"{len(brief.open_questions)} câu hỏi mở")
+        saved_brief = sink.load(pid, "brief") if resume else None
+        if saved_brief:
+            brief = Brief(**saved_brief)
+        else:
+            r.step("intake", "running")
+            memory = _memory(sink, pid)
+            if memory and memory.is_returning:
+                sink.event(pid, f"Khách quen {memory.client_name}: {len(memory.projects)} dự án trước, "
+                                f"{len(memory.decisions)} quyết định đã chốt")
+            brief = agents.intake(r.llm, message, memory)
+            r.save("brief", brief.model_dump())
+            r.step("intake", "done", f"{len(brief.open_questions)} câu hỏi mở")
 
-        r.step("analyst", "running")
-        spec = agents.analyst(r.llm, brief)
-        r.save("spec", spec.model_dump())
-        r.step("analyst", "done", f"{len(spec.sections)} mục")
+        saved_spec = sink.load(pid, "spec") if resume and saved_brief else None
+        if saved_spec:
+            spec = Spec(**saved_spec)
+        else:
+            r.step("analyst", "running")
+            spec = agents.analyst(r.llm, brief)
+            r.save("spec", spec.model_dump())
+            r.step("analyst", "done", f"{len(spec.sections)} mục")
 
         return _propose(r, brief, spec)
     return r.status or "failed"
@@ -151,25 +176,31 @@ def plan_project(pid: str, message: str, sink: Sink, budget_usd: float = 2.0,
 def revise_options(pid: str, note: str, sink: Sink, budget_usd: float = 2.0,
                    llm_factory: LLMFactory = make_llm) -> str:
     r = _Run(pid, sink, budget_usd, llm_factory)
+    r.resume = {"half": "revise", "note": note}
     revisions = (sink.load(pid, "revisions") or {"notes": []})["notes"]
     with r.guard():
         r.stage = "proposer"
         if len(revisions) >= MAX_REVISIONS:
             sink.event(pid, f"Đã chỉnh {MAX_REVISIONS} lần, cần sếp chọn một phương án hoặc giao việc mới")
             return r.end("awaiting_choice")
-        revisions.append(note)
-        r.save("revisions", {"notes": revisions})
         sink.event(pid, f"Sếp yêu cầu chỉnh phương án: {note}")
         brief = Brief(**sink.load(pid, "brief"))
         spec = Spec(**sink.load(pid, "spec"))
         previous = Proposal(**sink.load(pid, "proposal"))
-        return _propose(r, brief, spec, note, previous)
+        # Count the revision only once it went through, so a budget stop + resume doesn't use up two.
+        r.save("revisions", {"notes": revisions + [note]})
+        try:
+            return _propose(r, brief, spec, note, previous)
+        except BudgetExceeded:
+            r.save("revisions", {"notes": revisions})
+            raise
     return r.status or "failed"
 
 
 def build_project(pid: str, option_id: str, sink: Sink, workspace_root: Path, budget_usd: float = 2.0,
                   llm_factory: LLMFactory = make_llm) -> str:
     r = _Run(pid, sink, budget_usd, llm_factory)
+    r.resume = {"half": "build", "option_id": option_id}
     with r.guard():
         brief = Brief(**sink.load(pid, "brief"))
         proposal = Proposal(**sink.load(pid, "proposal"))
@@ -293,3 +324,22 @@ def run_project(pid: str, message: str, sink: Sink, workspace_root: Path, budget
     proposal = Proposal(**sink.load(pid, "proposal"))
     option_id = proposal.recommended if choose == "recommended" else choose
     return build_project(pid, option_id, sink, workspace_root, budget_usd, llm_factory)
+
+
+def resume_project(pid: str, sink: Sink, workspace_root: Path, budget_usd: float,
+                   llm_factory: LLMFactory = make_llm) -> str:
+    """Re-run the half that hit the budget ceiling, with the budget the boss just approved."""
+    stop = sink.load(pid, "budget_stop")
+    if not stop:
+        raise ValueError("Dự án không dừng vì ngân sách")
+    sink.artifact(pid, "budget_stop", {})
+    sink.artifact(pid, "budget_warning", {})
+    sink.event(pid, f"Tiếp tục từ bước {stop.get('stage')} với trần mới ${budget_usd:.2f}")
+    half = stop.get("half")
+    if half == "plan":
+        return plan_project(pid, stop["message"], sink, budget_usd, llm_factory, resume=True)
+    if half == "revise":
+        return revise_options(pid, stop["note"], sink, budget_usd, llm_factory)
+    if half == "build":
+        return build_project(pid, stop["option_id"], sink, workspace_root, budget_usd, llm_factory)
+    raise ValueError(f"Không biết tiếp tục bước {half}")

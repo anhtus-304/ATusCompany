@@ -3,6 +3,7 @@ const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "
 const STATUS = {
   running: "Đang chạy", awaiting_choice: "Chờ sếp chọn phương án", awaiting_approval: "Chờ sếp duyệt", needs_review: "Cần sếp xử lý",
   over_budget: "Chạm trần ngân sách", failed: "Lỗi", approved: "Đã duyệt", changes_requested: "Yêu cầu sửa",
+  stopped: "Đã dừng",
 };
 let current = null;
 let timer = null;
@@ -61,7 +62,8 @@ function list(items) { return `<ul>${(items || []).map((x) => `<li>${esc(x)}</li
 function render(p) {
   const a = p.artifacts || {};
   const cost = p.cost || {};
-  const done = !["running"].includes(p.status);
+  // Keep polling while the client email is being drafted after approval.
+  const done = p.status !== "running" && !(p.status === "approved" && !a.client_message);
   let html = `<h2>${esc(p.title)}</h2>
     <p>${p.client ? `<a href="#" data-client="${p.client.id}">${esc(p.client.name)}</a> · ` : ""}<span class="badge">${esc(STATUS[p.status] || p.status)}</span>
     ${p.status === "approved" ? `<a class="small" href="/api/projects/${encodeURIComponent(p.id)}/export">Tải gói giao khách (.zip)</a>` : ""}
@@ -75,6 +77,7 @@ function render(p) {
       <p class="muted small">Lễ tân, Kiến trúc sư và Báo cáo viên đã đọc phần này trước khi làm.</p>
       ${renderMemory(mem)}</section>`;
   }
+  if (p.status === "over_budget") html += renderBudget(p);
   if (a.proposal && p.status === "awaiting_choice") html += renderOptions(p);
   if (a.report) {
     const r = a.report;
@@ -85,10 +88,12 @@ function render(p) {
         <button data-decide="1">Duyệt gửi khách</button>
         <button class="secondary" data-decide="0">Yêu cầu sửa</button></div>` : ""}</section>`;
   }
+  if (a.delivery && a.report) html += renderDelivery(p);
   if (a.report || a.qa) {
+    const demo = a.delivery?.staging ? `/staging/${encodeURIComponent(p.id)}/` : `/preview/${encodeURIComponent(p.id)}/`;
     html += `<section class="box"><h3>Bản demo</h3>
-      <p><a href="/preview/${esc(p.id)}/" target="_blank">Mở trong tab mới</a></p>
-      <iframe src="/preview/${esc(p.id)}/index.html?t=${Date.now()}" title="Bản demo"></iframe></section>`;
+      <p><a href="${demo}" target="_blank">Mở trong tab mới</a></p>
+      <iframe src="${demo}?t=${Date.now()}" title="Bản demo"></iframe></section>`;
   }
   if (a.review) {
     const f = a.review.findings || [];
@@ -133,8 +138,61 @@ function render(p) {
   return done;
 }
 
+const STAGE_NAMES = { intake: "Lễ tân", analyst: "BA / Architect", proposer: "Đề xuất phương án", designer: "Designer",
+  backend_dev: "Backend Dev", frontend_dev: "Frontend Dev", qa: "QA", reviewer: "Reviewer", reporter: "Báo cáo viên" };
+
+function renderBudget(p) {
+  const stop = p.artifacts.budget_stop || {};
+  const spent = stop.spent_usd ?? p.cost?.spent_usd ?? 0;
+  return `<section class="box warn"><h3>Chạm trần ngân sách</h3>
+    <p>Dự án dừng ở bước <b>${esc(STAGE_NAMES[stop.stage] || stop.stage || "?")}</b>: đã tiêu $${Number(spent).toFixed(4)} / trần $${Number(p.budget_usd).toFixed(2)}.
+    Duyệt chi thêm thì đội làm tiếp từ bước đó, các bước đã xong không phải trả tiền lại.</p>
+    <form id="budget-form" class="row wrap"><label for="add-usd">Cấp thêm (USD)</label>
+      <input id="add-usd" type="number" min="0.01" max="50" step="0.01" value="${Math.max(1, Number(p.budget_usd)).toFixed(2)}">
+      <button type="submit">Duyệt chi thêm</button>
+      <button type="button" class="secondary" data-stop-project>Dừng dự án</button></form></section>`;
+}
+
+function renderDelivery(p) {
+  const a = p.artifacts;
+  const d = a.delivery || {};
+  const approved = p.status === "approved";
+  const short = (sha) => esc((sha || "").slice(0, 7));
+  const link = (r) => `<a href="${esc(new URL(r.url).pathname)}" target="_blank">${esc(r.url)}</a>`;
+  const m = a.client_message;
+  let html = `<section class="box"><h3>Giao hàng</h3>
+    <table class="tbl"><tbody>
+    <tr><th>Staging</th><td>${d.staging ? `${link(d.staging)} <span class="muted small">commit ${short(d.staging.sha)} · ${esc(d.staging.at)}</span>`
+      : '<span class="muted">Chưa có</span>'}<div class="muted small">Bản nội bộ để sếp xem, tự cập nhật sau mỗi lần build.</div></td></tr>
+    <tr><th>Production</th><td>${d.production ? `${link(d.production)} <span class="muted small">commit ${short(d.production.sha)} · ${esc(d.production.at)}</span>` : '<span class="muted">Chưa deploy</span>'}
+      ${approved ? `<div><button data-deploy>${d.production ? "Deploy lại bản đã duyệt" : "Deploy production"}</button></div>`
+        : '<div class="muted small">Cần duyệt bàn giao trước khi deploy.</div>'}</td></tr>
+    <tr><th>GitHub của khách</th><td>${(d.history || []).filter((h) => h.kind === "github").map((h) =>
+      `<div>${esc(h.repo)} · nhánh ${esc(h.branch)} · commit ${short(h.sha)} <span class="muted small">${esc(h.at)}</span></div>`).join("")}
+      ${approved ? `<form id="push-form" class="row wrap"><input id="repo" placeholder="chủ-repo/tên-repo" maxlength="201" required>
+        <input id="branch" value="main" maxlength="100" class="short"><button class="secondary">Đẩy code</button></form>`
+        : '<span class="muted small">Cần duyệt bàn giao trước.</span>'}</td></tr>
+    </tbody></table>`;
+  if (approved || m) {
+    const sent = m?.sent;
+    html += `<h4>Email gửi khách</h4>${!m ? '<p class="muted">Báo cáo viên đang soạn…</p>' : `
+      ${sent ? `<p class="${sent.sent ? "done" : "blocked"}">${sent.sent ? `Đã gửi cho ${esc(sent.to)} lúc ${esc(sent.at)}`
+        : `Chưa cấu hình máy chủ email nên chưa gửi thật: đã lưu vào hộp thư đi (${esc(sent.file)}) lúc ${esc(sent.at)}`}</p>` : ""}
+      <form id="mail-form" class="mail">
+        <label for="mail-to">Gửi tới</label><input id="mail-to" type="email" maxlength="200" value="${esc(m.to)}" placeholder="email của khách">
+        <label for="mail-subject">Tiêu đề</label><input id="mail-subject" maxlength="200" value="${esc(m.subject)}">
+        <label for="mail-body">Nội dung</label><textarea id="mail-body" rows="12" maxlength="10000">${esc(m.body)}</textarea>
+        ${approved ? `<div class="actions"><button type="submit">Gửi cho khách</button>
+          <button type="button" class="secondary" data-save-mail>Lưu bản nháp</button>
+          <button type="button" class="secondary" data-redraft>Soạn lại</button></div>` : ""}
+      </form>`}`;
+  }
+  return html + "</section>";
+}
+
 function renderMemory(mem) {
-  const KIND = { choice: "Chọn", revision: "Góp ý", approved: "Duyệt", changes_requested: "Yêu cầu sửa", note: "Ghi nhớ" };
+  const KIND = { choice: "Chọn", revision: "Góp ý", approved: "Duyệt", changes_requested: "Yêu cầu sửa", note: "Ghi nhớ",
+    budget: "Chi thêm", stopped: "Dừng", deployed: "Deploy", sent: "Gửi khách", pushed: "Giao code" };
   return `${mem.projects.length ? `<h4>Dự án trước</h4><ul>${mem.projects.map((x) =>
       `<li>${esc(x.date)}: ${esc(x.title)} · ngân sách ${esc(x.budget)}${x.chosen_name ? ` · chọn <b>${esc(x.chosen_name)}</b> ${vnd(x.price_vnd)}` : ""} <span class="badge">${esc(STATUS[x.status] || x.status)}</span></li>`).join("")}</ul>` : ""}
     ${mem.decisions.length ? `<h4>Quyết định đã chốt</h4><ul>${mem.decisions.map((d) =>
@@ -239,6 +297,21 @@ $("#detail").addEventListener("click", async (e) => {
     } catch (err) { alert(err.message); }
     return open(current);
   }
+  const pid = encodeURIComponent(current);
+  const act = async (fn) => { try { await fn(); } catch (err) { alert(err.message); } open(current); };
+  if (e.target.closest("[data-stop-project]")) {
+    if (!confirm("Dừng dự án ở đây? Đội sẽ không làm tiếp.")) return;
+    return act(() => api(`/api/projects/${pid}/budget`, { method: "POST", body: JSON.stringify({ approve: false }) }));
+  }
+  if (e.target.closest("[data-deploy]")) {
+    if (!confirm("Deploy bản sếp đã duyệt lên production? Khách và người ngoài sẽ xem được.")) return;
+    return act(() => api(`/api/projects/${pid}/deploy`, { method: "POST", body: JSON.stringify({ confirm: true }) }));
+  }
+  if (e.target.closest("[data-redraft]")) {
+    if (!confirm("Soạn lại email? Bản đang sửa sẽ mất.")) return;
+    return act(() => api(`/api/projects/${pid}/client-message`, { method: "POST" }));
+  }
+  if (e.target.closest("[data-save-mail]")) return act(saveMail);
   const b = e.target.closest("[data-decide]");
   if (!b) return;
   const approve = b.dataset.decide === "1";
@@ -262,6 +335,33 @@ $("#detail").addEventListener("submit", async (e) => {
     } catch (err) { alert(err.message); }
     return showClient(cid);
   }
+  const pid = encodeURIComponent(current);
+  if (e.target.id === "budget-form") {
+    e.preventDefault();
+    const add_usd = Number($("#add-usd").value);
+    if (!(add_usd > 0)) return;
+    try { await api(`/api/projects/${pid}/budget`, { method: "POST", body: JSON.stringify({ approve: true, add_usd }) }); }
+    catch (err) { alert(err.message); }
+    return open(current);
+  }
+  if (e.target.id === "push-form") {
+    e.preventDefault();
+    const repo = $("#repo").value.trim(), branch = $("#branch").value.trim() || "main";
+    if (!confirm(`Đẩy bản đã duyệt lên github.com/${repo}, nhánh ${branch}?`)) return;
+    try { await api(`/api/projects/${pid}/github`, { method: "POST", body: JSON.stringify({ repo, branch, confirm: true }) }); }
+    catch (err) { alert(err.message); }
+    return open(current);
+  }
+  if (e.target.id === "mail-form") {
+    e.preventDefault();
+    const to = $("#mail-to").value.trim();
+    if (!confirm(`Gửi email này cho ${to || "(chưa có địa chỉ)"}?`)) return;
+    try {
+      await saveMail();
+      await api(`/api/projects/${pid}/client-message/send`, { method: "POST", body: JSON.stringify({ confirm: true }) });
+    } catch (err) { alert(err.message); }
+    return open(current);
+  }
   if (e.target.id !== "revise") return;
   e.preventDefault();
   const note = $("#note").value.trim();
@@ -271,6 +371,11 @@ $("#detail").addEventListener("submit", async (e) => {
   } catch (err) { alert(err.message); }
   open(current);
 });
+
+function saveMail() {
+  return api(`/api/projects/${encodeURIComponent(current)}/client-message`, { method: "PUT", body: JSON.stringify({
+    to: $("#mail-to").value.trim(), subject: $("#mail-subject").value.trim(), body: $("#mail-body").value }) });
+}
 
 $("#new").addEventListener("submit", async (e) => {
   e.preventDefault();
