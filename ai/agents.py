@@ -13,7 +13,7 @@ from html.parser import HTMLParser
 from pathlib import Path
 
 from .artifacts import (
-    FEATURES, Brief, Check, CodeArtifact, DesignSpec, FileOut, FinalReport, Option, Proposal, QAReport,
+    FEATURES, Brief, Check, ClientMemory, CodeArtifact, DesignSpec, FileOut, FinalReport, Option, Proposal, QAReport,
     Section, Spec,
 )
 from .llm import LLM
@@ -44,8 +44,17 @@ def _guess_language(text: str) -> str:
     return "vi" if vi else "en"
 
 
-def intake(llm: LLM, message: str) -> Brief:
-    out = llm.structured("intake", prompt("intake"), f"Yêu cầu của khách:\n\n{message}", Brief)
+def extract_client_name(message: str) -> str | None:
+    """Brand/client name the boss quoted in the request, e.g. 'Mộc Coffee'."""
+    quoted = re.search(r"[\"“']([^\"”']{2,40})[\"”']", message)
+    return quoted.group(1).strip() if quoted else None
+
+
+def intake(llm: LLM, message: str, memory: ClientMemory | None = None) -> Brief:
+    user = f"Yêu cầu của khách:\n\n{message}"
+    if memory:
+        user += f"\n\nBộ nhớ về khách hàng (đừng hỏi lại điều đã biết):\n{memory.as_prompt()}"
+    out = llm.structured("intake", prompt("intake"), user, Brief)
     if out is not None:
         return out
 
@@ -55,23 +64,36 @@ def intake(llm: LLM, message: str) -> Brief:
         if re.search(pattern, lower):
             business, audience = b, a
             break
-    quoted = re.search(r"[\"“']([^\"”']{2,40})[\"”']", message)
-    name = quoted.group(1).strip() if quoted else business
+    name = extract_client_name(message) or (memory.client_name if memory and memory.is_returning else business)
     budget = re.search(r"(\d[\d.,]*\s*(?:triệu|tr|k|đ|vnd|usd|\$))", lower)
     deadline = re.search(r"(\d+\s*(?:ngày|tuần|tháng|days?|weeks?))", lower)
     assumptions = [f"Đối tượng: {audience}", "Giọng điệu thân thiện, đáng tin cậy",
-                   "Giai đoạn 1 chỉ làm landing page tĩnh một trang"]
+                   "Sản phẩm là landing page một trang"]
     questions = []
-    if not budget:
+    budget_text = budget.group(1) if budget else None
+    if memory and memory.is_returning:
+        last = memory.projects[-1]
+        assumptions.insert(0, f"Khách quen: đã làm {len(memory.projects)} dự án, gần nhất {last.date} ({last.title[:50]})")
+        if not budget_text and memory.last_budget():
+            budget_text = memory.last_budget()
+            assumptions.append(f"Lấy ngân sách theo lần trước: {budget_text}")
+        if memory.preferred_tier():
+            tier_name = {"fast": "Nhanh & rẻ", "balanced": "Cân bằng", "premium": "Cao cấp"}.get(
+                memory.preferred_tier(), memory.preferred_tier())
+            assumptions.append(f"Khách thường chọn phương án {tier_name}")
+        for n in memory.notes()[-3:]:
+            assumptions.append(f"Lưu ý đã chốt trước đây: {n}")
+    if not budget_text:
         questions.append("Ngân sách dự kiến cho dự án là bao nhiêu?")
     if not deadline:
         questions.append("Khách cần bàn giao khi nào?")
-    questions.append("Khách có logo, ảnh thật, địa chỉ và số điện thoại để thay chỗ giữ chỗ không?")
+    if not (memory and memory.is_returning):
+        questions.append("Khách có logo, ảnh thật, địa chỉ và số điện thoại để thay chỗ giữ chỗ không?")
     return Brief(
         project_name=name, business_type=business, goal=message.strip(),
         target_audience=audience, tone="Thân thiện, đáng tin cậy",
         language=_guess_language(message),
-        budget=budget.group(1) if budget else "chưa rõ",
+        budget=budget_text or "chưa rõ",
         deadline=deadline.group(1) if deadline else "chưa rõ",
         assumptions=assumptions, open_questions=questions,
     )
@@ -152,8 +174,8 @@ def _budget_vnd(text: str) -> int | None:
 
 
 def proposer(llm: LLM, brief: Brief, spec: Spec, note: str = "",
-             previous: Proposal | None = None) -> Proposal:
-    user = (f"Brief:\n{brief.model_dump_json(indent=2)}\n\nSpec gốc:\n{spec.model_dump_json(indent=2)}"
+             previous: Proposal | None = None, memory: ClientMemory | None = None) -> Proposal:
+    user = (f"Bộ nhớ khách hàng:\n{memory.as_prompt()}\n\n" if memory else "") + (f"Brief:\n{brief.model_dump_json(indent=2)}\n\nSpec gốc:\n{spec.model_dump_json(indent=2)}"
             f"\n\nTính năng cho phép:\n" + "\n".join(f"- {k}: {v}" for k, v in FEATURES.items()))
     if note:
         user += f"\n\nGóp ý của Sếp về các phương án lần trước:\n{note}"
@@ -161,11 +183,11 @@ def proposer(llm: LLM, brief: Brief, spec: Spec, note: str = "",
             user += f"\n\nPhương án lần trước:\n{previous.model_dump_json(indent=2)}"
     out = llm.structured("proposer", prompt("proposer"), user, Proposal)
     if out is None:
-        out = _mock_proposal(brief, spec, note)
+        out = _mock_proposal(brief, spec, note, memory)
     return _normalize_proposal(out)
 
 
-def _mock_proposal(brief: Brief, spec: Spec, note: str) -> Proposal:
+def _mock_proposal(brief: Brief, spec: Spec, note: str, memory: ClientMemory | None = None) -> Proposal:
     hero = spec.sections[0]
     contact = next(s for s in spec.sections if s.id == "contact")
     middle = [s for s in spec.sections if s.id not in ("hero", "contact")]
@@ -203,6 +225,15 @@ def _mock_proposal(brief: Brief, spec: Spec, note: str) -> Proposal:
     rec = "B" if any(o.id == "B" for o in fitting) else (fitting[-1].id if fitting else "A")
     reasoning = (f"Phương án {rec} vừa ngân sách {brief.budget} và đủ để đạt mục tiêu."
                  if budget else f"Chưa rõ ngân sách nên khuyên phương án {rec} để cân bằng chi phí và hiệu quả.")
+    tier = memory.preferred_tier() if memory else None
+    liked = next((o for o in fitting if o.tier == tier), None)
+    if liked and liked.id != rec:
+        rec = liked.id
+        reasoning = f"Khách quen thường chọn {liked.name} và phương án {rec} vẫn vừa ngân sách {brief.budget}."
+    elif tier and memory:
+        reasoning += f" Lần trước khách chọn {next(p.chosen_name for p in reversed(memory.projects) if p.chosen_name)}."
+    if memory and memory.notes():
+        reasoning += " Lưu ý đã chốt: " + "; ".join(memory.notes()[-2:]) + "."
     if note:
         reasoning += f" Đã ghi nhận góp ý của Sếp: {note}"
     return Proposal(options=options, recommended=rec, reasoning=reasoning)
@@ -536,14 +567,15 @@ def qa(spec: Spec, ws: RoleView) -> QAReport:
 
 def reporter(llm: LLM, brief: Brief, spec: Spec, qa_report: QAReport, fix_rounds: int,
              cost: dict, escalated: bool, option: Option | None = None,
-             review: "ReviewReport | None" = None) -> FinalReport:
+             review: "ReviewReport | None" = None, memory: ClientMemory | None = None) -> FinalReport:
     chosen = (f"Phương án sếp chọn: {option.id} - {option.name}, {option.est_days} ngày, "
               f"{option.est_price_vnd:,} VND, tính năng: {', '.join(option.features)}\n\n") if option else ""
     user = (f"Brief:\n{brief.model_dump_json(indent=2)}\n\n{chosen}Spec (rút gọn): {spec.project_name}, "
             f"{len(spec.sections)} mục: {', '.join(s.id for s in spec.sections)}\n\n"
             f"QA:\n{qa_report.model_dump_json(indent=2)}\n\nSố vòng sửa lỗi: {fix_rounds}\n"
             f"Đã vượt ngưỡng sửa lỗi tự động: {escalated}\nChi phí: {cost}"
-            + (f"\n\nReview:\n{review.model_dump_json(indent=2)}" if review else ""))
+            + (f"\n\nReview:\n{review.model_dump_json(indent=2)}" if review else "")
+            + (f"\n\nBộ nhớ khách hàng:\n{memory.as_prompt()}" if memory else ""))
     out = llm.structured("reporter", prompt("reporter"), user, FinalReport)
     if out is not None:
         return out
@@ -569,7 +601,9 @@ def reporter(llm: LLM, brief: Brief, spec: Spec, qa_report: QAReport, fix_rounds
     return FinalReport(
         summary=(f"Đã làm xong landing page tĩnh cho {spec.project_name} theo phương án "
                  f"{option.id + ' (' + option.name + ')' if option else 'mặc định'}, {len(spec.sections)} mục. "
-                 f"QA chạy {total} kiểm tra, {status} sau {fix_rounds} vòng sửa."),
+                 f"QA chạy {total} kiểm tra, {status} sau {fix_rounds} vòng sửa."
+                 + (f" Đây là dự án thứ {len(memory.projects) + 1} của khách {memory.client_name}."
+                    if memory and memory.is_returning else "")),
         done=["Tiếp nhận và chuẩn hóa yêu cầu", "Viết spec và tiêu chí nghiệm thu",
               *([f"Sếp chọn phương án {option.id}: {option.est_days:g} ngày, báo khách {option.est_price_vnd:,} VND"]
                 if option else []),

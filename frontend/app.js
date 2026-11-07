@@ -17,7 +17,7 @@ async function loadList() {
   const items = await api("/api/projects");
   $("#projects").innerHTML = items.map((p) =>
     `<li data-id="${esc(p.id)}" class="${p.id === current ? "active" : ""}">
-       <span class="t">${esc(p.title)}</span><span class="badge">${esc(STATUS[p.status] || p.status)}</span></li>`).join("")
+       <span class="t">${esc(p.title)}</span>${p.client ? `<span class="muted small">${esc(p.client)} · </span>` : ""}<span class="badge">${esc(STATUS[p.status] || p.status)}</span></li>`).join("")
     || '<li class="muted">Chưa có dự án</li>';
 }
 
@@ -63,11 +63,18 @@ function render(p) {
   const cost = p.cost || {};
   const done = !["running"].includes(p.status);
   let html = `<h2>${esc(p.title)}</h2>
-    <p><span class="badge">${esc(STATUS[p.status] || p.status)}</span>
+    <p>${p.client ? `<a href="#" data-client="${p.client.id}">${esc(p.client.name)}</a> · ` : ""}<span class="badge">${esc(STATUS[p.status] || p.status)}</span>
+    ${p.status === "approved" ? `<a class="small" href="/api/projects/${encodeURIComponent(p.id)}/export">Tải gói giao khách (.zip)</a>` : ""}
     ${cost.spent_usd !== undefined ? `<span class="muted small"> · Chi phí model: $${cost.spent_usd.toFixed(4)} / $${cost.budget_usd.toFixed(2)} · ${cost.calls} lần gọi</span>` : ""}</p>
     <div class="board">${p.tasks.map((t) => `<div class="card"><div>${esc(t.label)}</div>
       <div class="s ${esc(t.status)}">${esc(t.status)}</div><div class="muted small">${esc(t.note)}</div></div>`).join("")}</div>`;
 
+  const mem = a.memory;
+  if (mem && (mem.projects.length || mem.decisions.length)) {
+    html += `<section class="box"><h3>Bộ nhớ về ${esc(mem.client_name)}</h3>
+      <p class="muted small">Lễ tân, Kiến trúc sư và Báo cáo viên đã đọc phần này trước khi làm.</p>
+      ${renderMemory(mem)}</section>`;
+  }
   if (a.proposal && p.status === "awaiting_choice") html += renderOptions(p);
   if (a.report) {
     const r = a.report;
@@ -126,12 +133,85 @@ function render(p) {
   return done;
 }
 
+function renderMemory(mem) {
+  const KIND = { choice: "Chọn", revision: "Góp ý", approved: "Duyệt", changes_requested: "Yêu cầu sửa", note: "Ghi nhớ" };
+  return `${mem.projects.length ? `<h4>Dự án trước</h4><ul>${mem.projects.map((x) =>
+      `<li>${esc(x.date)}: ${esc(x.title)} · ngân sách ${esc(x.budget)}${x.chosen_name ? ` · chọn <b>${esc(x.chosen_name)}</b> ${vnd(x.price_vnd)}` : ""} <span class="badge">${esc(STATUS[x.status] || x.status)}</span></li>`).join("")}</ul>` : ""}
+    ${mem.decisions.length ? `<h4>Quyết định đã chốt</h4><ul>${mem.decisions.map((d) =>
+      `<li><span class="chip">${esc(KIND[d.kind] || d.kind)}</span> ${esc(d.text)} <span class="muted small">${esc(d.date)}</span></li>`).join("")}</ul>` : ""}`;
+}
+
+let view = "projects";
+
+async function showClients() {
+  clearTimeout(timer);
+  const items = await api("/api/clients");
+  $("#detail").innerHTML = `<h2>Khách hàng</h2>${items.length ? `<table class="tbl"><thead><tr><th>Khách</th><th>Liên hệ</th><th>Dự án</th><th>Gần nhất</th></tr></thead><tbody>
+    ${items.map((c) => `<tr><td><a href="#" data-client="${c.id}">${esc(c.name)}</a></td><td>${esc(c.contact || "")}</td><td>${c.projects}</td>
+      <td>${c.last_project_at ? new Date(c.last_project_at * 1000).toLocaleDateString("vi-VN") : ""}</td></tr>`).join("")}</tbody></table>`
+    : '<p class="muted">Chưa có khách hàng.</p>'}`;
+}
+
+async function showClient(cid) {
+  clearTimeout(timer);
+  const c = await api(`/api/clients/${cid}`);
+  $("#detail").innerHTML = `<h2>${esc(c.name)}</h2>
+    <form id="contact-form" class="row" data-cid="${c.id}"><label for="contact">Liên hệ</label>
+      <input id="contact" maxlength="200" value="${esc(c.contact || "")}" placeholder="SĐT, email, Zalo"><button class="secondary">Lưu</button></form>
+    <section class="box">${renderMemory(c.memory) || '<p class="muted">Chưa có lịch sử.</p>'}</section>
+    <form id="note-form" class="revise" data-cid="${c.id}"><label for="cnote">Ghi nhớ về khách (sở thích, điều đã chốt)</label>
+      <textarea id="cnote" rows="2" maxlength="1000" placeholder="Ví dụ: khách không thích màu đỏ, luôn cần bản tiếng Anh"></textarea>
+      <button class="secondary">Ghi nhớ</button></form>`;
+}
+
+const AGENT_NAMES = { leader: "Trưởng phòng", intake: "Lễ tân", architect: "Kiến trúc sư", reporter: "Báo cáo viên",
+  frontend: "Frontend Dev", backend: "Backend Dev", reviewer: "Reviewer", designer: "Designer", qa: "Tester" };
+const pct = (x) => (x === undefined || x === null ? "–" : Math.round(x * 100) + "%");
+const num = (x, d = 1) => (x === undefined || x === null ? "–" : Number(x).toFixed(d));
+
+async function showTeam() {
+  clearTimeout(timer);
+  const card = await api("/api/agents/scorecard");
+  const rows = Object.keys(AGENT_NAMES).filter((k) => card[k]).map((k) => [k, card[k]]);
+  $("#detail").innerHTML = `<h2>Đội ngũ</h2>
+    <p class="muted small">Tính trên mọi dự án. Đạt ngay lần đầu = QA và Reviewer không trả lỗi về cho dev đó.</p>
+    ${rows.length ? `<table class="tbl"><thead><tr><th>Agent</th><th>Việc xong</th><th>Bị chặn/lỗi</th><th>Thời gian TB (s)</th>
+      <th>Đạt ngay lần đầu</th><th>Vòng sửa TB</th><th>Chi phí model</th><th>Khác</th></tr></thead><tbody>
+      ${rows.map(([k, m]) => `<tr><td>${esc(AGENT_NAMES[k])}</td><td>${m.tasksDone}</td><td>${m.tasksStuck}</td><td>${num(m.avgSeconds, 2)}</td>
+        <td>${pct(m.firstPassRate)}</td><td>${num(m.avgRounds)}</td><td>$${num(m.costUsd, 4)}</td>
+        <td class="small">${[m.findingsPerProject !== undefined ? `${num(m.findingsPerProject)} ghi chú/dự án, ${num(m.blockingPerProject)} chặn` : "",
+          m.checksPerProject !== undefined ? `${num(m.checksPerProject, 0)} kiểm tra/dự án` : "",
+          m.approvalRate !== undefined ? `sếp duyệt ${pct(m.approvalRate)}` : ""].filter(Boolean).join(" · ")}</td></tr>`).join("")}
+      </tbody></table>` : '<p class="muted">Chưa có số liệu. Chạy xong một dự án sẽ có.</p>'}`;
+}
+
+function setView(v) {
+  view = v;
+  document.querySelectorAll(".tab").forEach((t) => t.classList.toggle("active", t.dataset.view === v));
+  if (v === "clients") showClients();
+  else if (v === "team") showTeam();
+  else if (current) open(current);
+  else $("#detail").innerHTML = '<p class="muted">Giao việc mới hoặc chọn một dự án.</p>';
+}
+
+document.querySelector(".tabs").addEventListener("click", (e) => {
+  const t = e.target.closest("[data-view]");
+  if (t) setView(t.dataset.view);
+});
+
+async function loadClients() {
+  const items = await api("/api/clients");
+  $("#clientlist").innerHTML = items.map((c) => `<option value="${esc(c.name)}"></option>`).join("");
+}
+
 async function open(id) {
   current = id;
+  view = "projects";
+  document.querySelectorAll(".tab").forEach((t) => t.classList.toggle("active", t.dataset.view === "projects"));
   clearTimeout(timer);
   const tick = async () => {
     const p = await api(`/api/projects/${encodeURIComponent(id)}`);
-    if (current !== id) return;
+    if (current !== id || view !== "projects") return;
     const finished = render(p);
     loadList();
     if (!finished) timer = setTimeout(tick, 1200);
@@ -145,6 +225,12 @@ $("#projects").addEventListener("click", (e) => {
 });
 
 $("#detail").addEventListener("click", async (e) => {
+  const cl = e.target.closest("[data-client]");
+  if (cl) {
+    e.preventDefault();
+    document.querySelectorAll(".tab").forEach((t) => t.classList.toggle("active", t.dataset.view === "clients"));
+    return showClient(cl.dataset.client);
+  }
   const c = e.target.closest("[data-choose]");
   if (c) {
     c.disabled = true;
@@ -162,6 +248,20 @@ $("#detail").addEventListener("click", async (e) => {
 });
 
 $("#detail").addEventListener("submit", async (e) => {
+  if (e.target.id === "note-form" || e.target.id === "contact-form") {
+    e.preventDefault();
+    const cid = e.target.dataset.cid;
+    try {
+      if (e.target.id === "note-form") {
+        const text = $("#cnote").value.trim();
+        if (text.length < 2) return;
+        await api(`/api/clients/${cid}/notes`, { method: "POST", body: JSON.stringify({ text }) });
+      } else {
+        await api(`/api/clients/${cid}`, { method: "PATCH", body: JSON.stringify({ contact: $("#contact").value.trim() }) });
+      }
+    } catch (err) { alert(err.message); }
+    return showClient(cid);
+  }
   if (e.target.id !== "revise") return;
   e.preventDefault();
   const note = $("#note").value.trim();
@@ -178,11 +278,14 @@ $("#new").addEventListener("submit", async (e) => {
   if (message.length < 5) return;
   const btn = e.submitter; btn.disabled = true;
   try {
-    const { id } = await api("/api/projects", { method: "POST", body: JSON.stringify({ message, budget_usd: Number($("#budget").value) || null }) });
+    const client = $("#client").value.trim() || null;
+    const { id } = await api("/api/projects", { method: "POST", body: JSON.stringify({ message, client, budget_usd: Number($("#budget").value) || null }) });
     $("#msg").value = "";
+    loadClients();
     await loadList();
     open(id);
   } catch (err) { alert(err.message); } finally { btn.disabled = false; }
 });
 
 loadList();
+loadClients();

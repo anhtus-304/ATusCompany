@@ -2,7 +2,7 @@
 
 Phòng công nghệ ảo chạy bằng AI. Sếp nhắn yêu cầu của khách, các agent tự tiếp nhận, viết spec, code, kiểm thử và gửi báo cáo kèm bản demo để sếp duyệt.
 
-**Trạng thái: Giai đoạn 3** — đội đủ vai, tách frontend/backend, có QA chạy test thật và Reviewer:
+**Trạng thái: Giai đoạn 4** — có bộ nhớ khách hàng, quyết định đã chốt và bảng điểm từng agent. Luồng làm việc:
 
 ```
 Sếp nhắn → Lễ tân (brief) → BA/Architect (spec) → Đề xuất 3 phương án
@@ -37,6 +37,21 @@ trường bí mật. Khi dùng cho khách thật nên chạy trong container (`i
 **Reviewer** dò khóa bí mật trong code, eval/exec/shell, SQL ghép chuỗi, trả lỗi lộ stack trace, thiếu giới hạn đầu
 vào, `javascript:` và sự kiện nội tuyến trong HTML; khi có model thật thì model review thêm. Lỗi mức blocker/major
 quay lại dev phụ trách; gợi ý minor vào báo cáo.
+
+**Bộ nhớ khách hàng (giai đoạn 4).** Mỗi dự án gắn với một khách (ô "Khách hàng" khi giao việc, hoặc tên
+trong ngoặc kép như `'Mộc Coffee'`). Hệ thống tự ghi nhớ các quyết định của sếp: phương án đã chọn, góp ý làm lại,
+duyệt hoặc yêu cầu sửa, cùng ghi chú tay ở trang Khách hàng. Dự án sau của cùng khách:
+- Lễ tân không hỏi lại điều đã biết (ví dụ lấy ngân sách lần trước) và ghi các lưu ý đã chốt vào giả định.
+- Kiến trúc sư ưu tiên phương án khách hay chọn nếu vẫn vừa ngân sách, và nêu lý do.
+- Báo cáo viên biết đây là dự án thứ mấy của khách.
+
+**Bảng điểm đội ngũ** (`GET /api/agents/scorecard`, tab Đội ngũ): việc xong, bị chặn, thời gian trung bình,
+tỷ lệ đạt ngay lần đầu và số vòng sửa của từng dev, chi phí model theo agent, số ghi chú của Reviewer, số kiểm
+tra của QA, tỷ lệ sếp duyệt. Số liệu này cũng gửi qua WebSocket trong trường `metrics` của từng agent.
+
+**Giao khách.** Sau khi sếp duyệt, `GET /api/projects/{id}/export` tải gói zip của dự án, kèm lịch sử git
+riêng để đẩy lên GitHub của khách. Dữ liệu khách để lại qua form (`api/data/`) không bao giờ nằm trong gói
+và không xem được qua trang demo.
 
 **Dashboard văn phòng pixel** (`dashboard/`, làm riêng) đọc luồng sự kiện realtime ở `ws://<host>/ws/events`
 theo hợp đồng trong `dashboard/src/types.ts`: `snapshot`, `agent`, `task`, `log`; gửi `{type: "assign", to, text}`
@@ -102,4 +117,5 @@ Test: `python -m pytest -q`
 - [x] Giai đoạn 1: nhắn → spec → code → test → báo cáo cho landing page tĩnh
 - [x] Giai đoạn 2: tạo 2–3 phương án (nhanh/rẻ, cân bằng, cao cấp) và cơ chế chọn
 - [x] Giai đoạn 3: tách frontend/backend, thêm QA chạy test thật, Reviewer bảo mật, UI/UX Designer, WebSocket cho dashboard
-- [ ] Giai đoạn 4: bộ nhớ dự án, lịch sử khách hàng, dashboard đầy đủ, đẩy repo lên GitHub của khách
+- [x] Giai đoạn 4: bộ nhớ khách hàng và quyết định đã chốt, bảng điểm từng agent, gói giao khách
+- [ ] Tiếp theo: chạy thử với model thật và chỉnh prompt, đẩy thẳng lên GitHub của khách (cần token), dashboard pixel (luồng riêng)

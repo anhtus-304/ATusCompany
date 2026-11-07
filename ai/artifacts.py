@@ -10,6 +10,61 @@ from typing import Literal
 from pydantic import BaseModel, Field
 
 
+class PastProject(BaseModel):
+    project_id: str
+    title: str
+    status: str
+    date: str
+    budget: str = "chưa rõ"
+    chosen_tier: str | None = None
+    chosen_name: str | None = None
+    price_vnd: int | None = None
+    features: list[str] = Field(default_factory=list)
+
+
+class PastDecision(BaseModel):
+    kind: str  # choice | revision | approved | changes_requested | note
+    text: str
+    date: str
+
+
+class ClientMemory(BaseModel):
+    """What the office remembers about a client: earlier projects and decisions already made."""
+
+    client_name: str
+    contact: str = ""
+    projects: list[PastProject] = Field(default_factory=list)
+    decisions: list[PastDecision] = Field(default_factory=list)
+
+    @property
+    def is_returning(self) -> bool:
+        return bool(self.projects)
+
+    def last_budget(self) -> str | None:
+        for p in reversed(self.projects):
+            if p.budget and p.budget != "chưa rõ":
+                return p.budget
+        return None
+
+    def preferred_tier(self) -> str | None:
+        tiers = [p.chosen_tier for p in self.projects if p.chosen_tier]
+        return max(set(tiers), key=tiers.count) if tiers else None
+
+    def notes(self) -> list[str]:
+        return [d.text for d in self.decisions if d.kind in ("note", "revision", "changes_requested")]
+
+    def as_prompt(self) -> str:
+        if not self.projects and not self.decisions:
+            return f"Khách mới: {self.client_name}. Chưa có lịch sử."
+        lines = [f"Khách quen: {self.client_name}" + (f" ({self.contact})" if self.contact else "")]
+        for p in self.projects[-5:]:
+            chosen = f", chọn {p.chosen_name} ({p.price_vnd:,} VND)" if p.chosen_name and p.price_vnd else ""
+            lines.append(f"- {p.date}: {p.title} | ngân sách {p.budget}{chosen} | trạng thái {p.status}")
+        for d in self.decisions[-10:]:
+            lines.append(f"- Quyết định {d.date} [{d.kind}]: {d.text}")
+        return "\n".join(lines)
+
+
 class Brief(BaseModel):
     """Intake (Lễ tân) output: the client's request, cleaned up."""
 

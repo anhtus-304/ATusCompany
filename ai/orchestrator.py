@@ -23,7 +23,9 @@ from pathlib import Path
 from typing import Callable, Iterator, Protocol
 
 from . import agents, team
-from .artifacts import Brief, Check, Proposal, QAReport, Spec
+import time
+
+from .artifacts import Brief, Check, ClientMemory, Proposal, QAReport, Spec
 from .llm import BudgetExceeded, CostTracker, LLM, make_llm
 from .workspace import Workspace
 
@@ -54,6 +56,12 @@ class Sink(Protocol):
     def load(self, project_id: str, name: str) -> dict | None: ...
     def event(self, project_id: str, text: str) -> None: ...
     def finish(self, project_id: str, status: str, cost: dict) -> None: ...
+    # Optional: def metric(self, project_id: str, agent: str, name: str, value: float) -> None
+
+
+def _memory(sink: Sink, pid: str) -> ClientMemory | None:
+    data = sink.load(pid, "memory")
+    return ClientMemory(**data) if data else None
 
 
 class _Run:
@@ -66,9 +74,19 @@ class _Run:
         self.llm = llm_factory(self.cost)
         self.stage = "intake"
         self.status: str | None = None
+        self._started: dict[str, float] = {}
+
+    def metric(self, agent: str, name: str, value: float) -> None:
+        fn = getattr(self.sink, "metric", None)
+        if fn:
+            fn(self.pid, agent, name, value)
 
     def step(self, stage: str, status: str, note: str = "") -> None:
         self.stage = stage
+        if status == "running":
+            self._started.setdefault(stage, time.monotonic())
+        elif status in ("done", "failed", "blocked") and stage in self._started:
+            self.metric(stage, "seconds", time.monotonic() - self._started.pop(stage))
         self.sink.task(self.pid, stage, status, note)
 
     def save(self, name: str, data: dict) -> None:
@@ -76,6 +94,10 @@ class _Run:
 
     def end(self, status: str) -> str:
         self.status = status
+        before = (self.sink.load(self.pid, "cost") or {}).get("by_agent", {})
+        for agent, usd in self.cost.by_agent.items():
+            if usd - before.get(agent, 0.0) > 0:
+                self.metric(agent, "cost_usd", usd - before.get(agent, 0.0))
         self.save("cost", self.cost.to_dict())
         self.sink.finish(self.pid, status, self.cost.to_dict())
         return status
@@ -96,7 +118,7 @@ class _Run:
 
 def _propose(r: _Run, brief: Brief, spec: Spec, note: str = "", previous: Proposal | None = None) -> str:
     r.step("proposer", "running", "chỉnh theo góp ý" if note else "")
-    proposal = agents.proposer(r.llm, brief, spec, note, previous)
+    proposal = agents.proposer(r.llm, brief, spec, note, previous, _memory(r.sink, r.pid))
     r.save("proposal", proposal.model_dump())
     r.step("proposer", "done", f"{len(proposal.options)} phương án, khuyên {proposal.recommended}")
     r.step("choice", "blocked", "chờ sếp chọn")
@@ -109,7 +131,11 @@ def plan_project(pid: str, message: str, sink: Sink, budget_usd: float = 2.0,
     sink.event(pid, f"Bắt đầu dự án, model: {r.llm.name}, trần ngân sách ${budget_usd:.2f}")
     with r.guard():
         r.step("intake", "running")
-        brief = agents.intake(r.llm, message)
+        memory = _memory(sink, pid)
+        if memory and memory.is_returning:
+            sink.event(pid, f"Khách quen {memory.client_name}: {len(memory.projects)} dự án trước, "
+                            f"{len(memory.decisions)} quyết định đã chốt")
+        brief = agents.intake(r.llm, message, memory)
         r.save("brief", brief.model_dump())
         r.step("intake", "done", f"{len(brief.open_questions)} câu hỏi mở")
 
@@ -183,14 +209,17 @@ def build_project(pid: str, option_id: str, sink: Sink, workspace_root: Path, bu
 
         # 2. Frontend needs the design and the API contract.
         front_code, front_fail, back_fail, rounds = None, None, None, 0
+        front_rounds, back_rounds = 0, (1 if spec.api else 0)
         need_front = True
         while True:
             if need_front:
                 r.step("frontend_dev", "running", f"vòng {rounds + 1}")
                 front_code = agents.frontend_dev(r.llm, spec, views["frontend_dev"], front_fail, front_code, design)
+                front_rounds += 1
                 r.step("frontend_dev", "done")
             if back_fail:
                 backend_code = run_backend([f"{c.name}: {c.detail}" for c in back_fail], backend_code)
+                back_rounds += 1
             sha = ws.commit(f"option {option.id}, round {rounds + 1}" + (" (fixes)" if rounds else ""))
             sink.event(pid, f"Commit {sha}" if sha else "Không có thay đổi để commit")
 
@@ -233,8 +262,21 @@ def build_project(pid: str, option_id: str, sink: Sink, workspace_root: Path, bu
             rounds += 1
 
         escalated = not (report.passed and review.passed)
+        # Quality scorecard: did each dev's work pass on the first try, and how many rounds did it take?
+        all_issues = report.failures() + review.blocking()
+        r.metric("frontend_dev", "first_pass", 1.0 if front_rounds == 1 and not (escalated and any(
+            i.owner == "frontend_dev" for i in all_issues)) else 0.0)
+        r.metric("frontend_dev", "rounds", front_rounds)
+        if spec.api:
+            r.metric("backend_dev", "first_pass", 1.0 if back_rounds == 1 and not (escalated and any(
+                i.owner == "backend_dev" for i in all_issues)) else 0.0)
+            r.metric("backend_dev", "rounds", back_rounds)
+        r.metric("qa", "checks", len(report.checks))
+        r.metric("reviewer", "findings", len(review.findings))
+        r.metric("reviewer", "blocking_findings", len(review.blocking()))
         r.step("reporter", "running")
-        final = agents.reporter(r.llm, brief, spec, report, rounds, r.cost.to_dict(), escalated, option, review)
+        final = agents.reporter(r.llm, brief, spec, report, rounds, r.cost.to_dict(), escalated, option, review,
+                                _memory(sink, pid))
         r.save("report", final.model_dump())
         r.save("git", {"log": ws.log(), "path": str(ws.dir)})
         r.step("reporter", "done")

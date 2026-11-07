@@ -64,6 +64,7 @@ class Office:
         self.log: deque[dict] = deque(maxlen=log_size)
         self._ids = itertools.count(1)
         self._subs: set[tuple[asyncio.AbstractEventLoop, asyncio.Queue]] = set()
+        self.metrics_provider = None  # () -> {agent_id: metrics}; set by the app
 
     # -- subscribers (one per WebSocket)
     def subscribe(self) -> asyncio.Queue:
@@ -90,9 +91,12 @@ class Office:
         q.put_nowait(msg)
 
     def snapshot(self, company: str) -> dict:
+        metrics = self.metrics_provider() if self.metrics_provider else {}
         with self.lock:
             tasks = sorted(self.tasks.values(), key=lambda t: t["createdAt"])[-200:]
-            return {"type": "snapshot", "company": company, "agents": list(self.agents.values()),
+            agents = [{**a, "metrics": metrics.get(a["id"])} if a["id"] in metrics else dict(a)
+                      for a in self.agents.values()]
+            return {"type": "snapshot", "company": company, "agents": agents,
                     "tasks": tasks, "log": list(self.log)}
 
     # -- state changes
@@ -173,11 +177,50 @@ class OfficeSink:
         if not text.startswith("Traceback"):
             self.office.add_log("leader", "info", text)
 
+    def metric(self, pid: str, agent: str, name: str, value: float) -> None:
+        self.store.metric(pid, agent, name, value)
+
     def finish(self, pid: str, status: str, cost: dict) -> None:
         self.store.finish(pid, status, cost)
+        if self.office.metrics_provider:
+            for agent_id, m in self.office.metrics_provider().items():
+                self.office.update_agent(agent_id, metrics=m)
         labels = {"awaiting_choice": "chờ sếp chọn phương án", "awaiting_approval": "xong, chờ sếp duyệt gửi khách",
                   "needs_review": "cần sếp xử lý", "over_budget": "chạm trần ngân sách", "failed": "gặp lỗi"}
         kind = {"awaiting_approval": "done", "awaiting_choice": "review", "needs_review": "blocked",
                 "over_budget": "blocked", "failed": "error"}.get(status, "info")
         self.office.add_log("leader", kind, f"Dự án \"{self._title(pid)[:60]}\" {labels.get(status, status)}"
                             f" (chi phí ${cost.get('spent_usd', 0):.4f})")
+
+
+def build_scorecard(store) -> dict[str, dict]:
+    """Quality per office agent (camelCase, matches the dashboard's optional Agent.metrics)."""
+    raw = store.scorecard()
+    out: dict[str, dict] = {}
+    for stage, data in raw.items():
+        agent_id = STAGE_AGENT.get(stage, (None,))[0]
+        if not agent_id:
+            continue
+        a = out.setdefault(agent_id, {"tasksDone": 0, "tasksStuck": 0, "seconds": [0.0, 0], "costUsd": 0.0})
+        a["tasksDone"] += data.get("tasks_done", 0)
+        a["tasksStuck"] += data.get("tasks_stuck", 0)
+        if "seconds" in data:
+            a["seconds"][0] += data["seconds"]["total"]
+            a["seconds"][1] += data["seconds"]["n"]
+        if "cost_usd" in data:
+            a["costUsd"] += data["cost_usd"]["total"]
+        if "first_pass" in data:
+            a["firstPassRate"] = round(data["first_pass"]["avg"], 3)
+            a["avgRounds"] = round(data["rounds"]["avg"], 2) if "rounds" in data else None
+        if "findings" in data:
+            a["findingsPerProject"] = round(data["findings"]["avg"], 2)
+            a["blockingPerProject"] = round(data.get("blocking_findings", {}).get("avg", 0), 2)
+        if "checks" in data:
+            a["checksPerProject"] = round(data["checks"]["avg"], 1)
+        if "boss_approved" in data:
+            a["approvalRate"] = round(data["boss_approved"]["avg"], 3)
+    for a in out.values():
+        total, n = a.pop("seconds")
+        a["avgSeconds"] = round(total / n, 2) if n else None
+        a["costUsd"] = round(a["costUsd"], 6)
+    return out
