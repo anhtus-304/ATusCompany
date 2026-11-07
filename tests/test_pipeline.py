@@ -8,7 +8,7 @@ os.environ["VTD_LLM"] = "mock"
 from ai import agents  # noqa: E402
 from ai.artifacts import CodeArtifact, FileOut  # noqa: E402
 from ai.llm import BudgetExceeded, CostTracker, MockLLM  # noqa: E402
-from ai.orchestrator import run_project  # noqa: E402
+from ai.orchestrator import build_project, plan_project, revise_options, run_project  # noqa: E402
 from ai.workspace import PermissionDenied, Workspace  # noqa: E402
 
 
@@ -21,6 +21,9 @@ class MemSink:
 
     def artifact(self, pid, name, data):
         self.artifacts[name] = data
+
+    def load(self, pid, name):
+        return self.artifacts.get(name)
 
     def event(self, pid, text):
         self.events.append(text)
@@ -37,6 +40,7 @@ def test_end_to_end_mock(tmp_path):
     status = run_project("p1", MSG, sink, tmp_path)
     assert status == "awaiting_approval"
     assert all(s == "done" for s in sink.tasks.values()), sink.tasks
+    assert sink.artifacts["choice"]["option_id"] == "B"  # 5 triệu budget -> balanced
     assert sink.artifacts["brief"]["project_name"] == "Mộc Coffee"
     assert sink.artifacts["brief"]["budget"] == "5 triệu"
     assert sink.artifacts["qa"]["passed"]
@@ -111,14 +115,85 @@ def test_api_flow(tmp_path, monkeypatch):
     from fastapi.testclient import TestClient
 
     c = TestClient(appmod.app)
+    def wait():
+        for _ in range(50):
+            p = c.get(f"/api/projects/{pid}").json()
+            if p["status"] != "running":
+                return p
+            time.sleep(0.1)
+
     pid = c.post("/api/projects", json={"message": MSG}).json()["id"]
-    for _ in range(50):
-        p = c.get(f"/api/projects/{pid}").json()
-        if p["status"] != "running":
-            break
-        time.sleep(0.1)
-    assert p["status"] == "awaiting_approval"
+    p = wait()
+    assert p["status"] == "awaiting_choice"
+    assert [o["id"] for o in p["artifacts"]["proposal"]["options"]] == ["A", "B", "C"]
+    assert c.post(f"/api/projects/{pid}/decision", json={"approve": True}).status_code == 409
+    assert c.post(f"/api/projects/{pid}/choice", json={"option_id": "Z"}).status_code == 400
+    assert c.post(f"/api/projects/{pid}/choice", json={"note": "rẻ hơn"}).json()["action"] == "revise"
+    p = wait()
+    assert p["status"] == "awaiting_choice" and p["artifacts"]["revisions"]["notes"] == ["rẻ hơn"]
+    assert c.post(f"/api/projects/{pid}/choice", json={"option_id": "C"}).json()["action"] == "build"
+    assert c.post(f"/api/projects/{pid}/choice", json={"option_id": "C"}).status_code == 409
+    p = wait()
+    assert p["status"] == "awaiting_approval", p["events"][-5:]
+    assert p["artifacts"]["qa"]["passed"]
     assert c.get(f"/preview/{pid}/index.html").status_code == 200
     assert c.get(f"/preview/{pid}/.git/config").status_code == 404
     assert c.post(f"/api/projects/{pid}/decision", json={"approve": True}).json()["status"] == "approved"
     assert c.get("/").status_code == 200
+
+
+def test_proposal_options(tmp_path):
+    sink = MemSink()
+    assert plan_project("p6", MSG, sink) == "awaiting_choice"
+    assert sink.tasks["choice"] == "blocked"
+    assert "frontend_dev" not in sink.tasks, "nothing is built before the boss chooses"
+    opts = sink.artifacts["proposal"]["options"]
+    assert [o["tier"] for o in opts] == ["fast", "balanced", "premium"]
+    prices = [o["est_price_vnd"] for o in opts]
+    assert prices == sorted(prices)
+    assert any("Vượt ngân sách" in c for c in opts[2]["cons"])
+    for o in opts:
+        ids = [s["id"] for s in o["sections"]]
+        assert ids[0] == "hero" and "contact" in ids
+
+
+@pytest.mark.parametrize("option_id", ["A", "B", "C"])
+def test_every_option_builds_and_passes_qa(tmp_path, option_id):
+    sink = MemSink()
+    plan_project("p7", MSG, sink)
+    assert build_project("p7", option_id, sink, tmp_path) == "awaiting_approval"
+    qa_names = [c["name"] for c in sink.artifacts["qa"]["checks"]]
+    option = next(o for o in sink.artifacts["proposal"]["options"] if o["id"] == option_id)
+    assert sum(n.startswith("Tính năng:") for n in qa_names) == len(option["features"])
+    assert sink.artifacts["qa"]["passed"], [c for c in sink.artifacts["qa"]["checks"] if not c["passed"]]
+
+
+def test_qa_checks_option_features(tmp_path):
+    sink = MemSink()
+    plan_project("p8", MSG, sink)
+    build_project("p8", "A", sink, tmp_path)  # A has no dark mode / FAQ / form
+    from ai.artifacts import Spec
+    spec = Spec(**sink.artifacts["final_spec"])
+    spec.features = ["dark_mode", "contact_form", "seo_meta"]
+    report = agents.qa(spec, Workspace(tmp_path, "p8").for_role("qa"))
+    failed = {c.name for c in report.failures()}
+    assert len(failed) == 3 and all(n.startswith("Tính năng:") for n in failed)
+
+
+def test_revision_limit(tmp_path, monkeypatch):
+    import ai.orchestrator as orch
+    monkeypatch.setattr(orch, "MAX_REVISIONS", 1)
+    sink = MemSink()
+    plan_project("p9", MSG, sink)
+    assert revise_options("p9", "bỏ mục khách hàng", sink) == "awaiting_choice"
+    assert "bỏ mục khách hàng" in sink.artifacts["proposal"]["reasoning"]
+    revise_options("p9", "lần nữa", sink)
+    assert sink.artifacts["revisions"]["notes"] == ["bỏ mục khách hàng"]
+
+
+def test_cost_carries_across_halves(tmp_path):
+    sink = MemSink()
+    plan_project("p10", MSG, sink, llm_factory=lambda c: _Spender(c))
+    first = sink.artifacts["cost"]["calls"]
+    build_project("p10", "A", sink, tmp_path, llm_factory=lambda c: _Spender(c))
+    assert sink.artifacts["cost"]["calls"] > first

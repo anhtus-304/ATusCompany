@@ -76,7 +76,19 @@ class Store:
     def set_status(self, pid: str, status: str) -> None:
         self._x("UPDATE projects SET status=?, updated_at=? WHERE id=?", (status, time.time(), pid))
 
+    def transition(self, pid: str, expected: str, status: str) -> bool:
+        """Atomically move from one status to another, so a double click can't start two runs."""
+        with self.lock:
+            cur = self.db.execute("UPDATE projects SET status=?, updated_at=? WHERE id=? AND status=?",
+                                  (status, time.time(), pid, expected))
+            self.db.commit()
+            return cur.rowcount == 1
+
     # -- Sink protocol used by the orchestrator
+    def load(self, pid: str, name: str) -> dict | None:
+        rows = self._x("SELECT data FROM artifacts WHERE project_id=? AND name=?", (pid, name))
+        return json.loads(rows[0]["data"]) if rows else None
+
     def task(self, pid: str, stage: str, status: str, note: str = "") -> None:
         self._x("UPDATE tasks SET status=?, note=?, updated_at=? WHERE project_id=? AND stage=?",
                 (status, note, time.time(), pid, stage))

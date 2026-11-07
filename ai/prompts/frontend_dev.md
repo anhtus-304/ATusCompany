@@ -11,4 +11,13 @@ Bắt buộc:
 - Liên kết nội bộ `href="#id"` phải trỏ tới id có thật.
 - Responsive tới 360px, dùng màu từ `palette`.
 
+Tính năng trong `spec.features` phải làm đúng như sau (QA kiểm tra bằng máy):
+- `responsive`: có `@media` trong CSS.
+- `sticky_nav`: header có `position: sticky`.
+- `dark_mode`: có `@media (prefers-color-scheme: dark)` đổi màu.
+- `animations`: có `@keyframes` và tôn trọng `prefers-reduced-motion`.
+- `faq_accordion`: mục `#faq` dùng các thẻ `<details>` / `<summary>`.
+- `contact_form`: có `<form action="mailto:...">` trong mục `#contact`.
+- `seo_meta`: có `<meta name="description">` (dùng `meta_description`) và `<meta property="og:title">`.
+
 Nếu có lỗi QA, sửa đúng các lỗi đó và giữ nguyên phần đang đúng.

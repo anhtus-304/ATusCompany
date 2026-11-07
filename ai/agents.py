@@ -13,7 +13,8 @@ from html.parser import HTMLParser
 from pathlib import Path
 
 from .artifacts import (
-    Brief, Check, CodeArtifact, FileOut, FinalReport, QAReport, Section, Spec,
+    FEATURES, Brief, Check, CodeArtifact, FileOut, FinalReport, Option, Proposal, QAReport,
+    Section, Spec,
 )
 from .llm import LLM
 from .workspace import RoleView
@@ -140,6 +141,97 @@ def _normalize_spec(spec: Spec) -> Spec:
     return spec
 
 
+# --------------------------------------------------------------------------- Proposer (Architect)
+
+def _budget_vnd(text: str) -> int | None:
+    m = re.search(r"(\d+(?:[.,]\d+)?)\s*(triệu|tr\b|k\b|nghìn)", text.lower())
+    if not m:
+        return None
+    n = float(m.group(1).replace(",", "."))
+    return int(n * (1_000_000 if m.group(2).startswith("tr") else 1_000))
+
+
+def proposer(llm: LLM, brief: Brief, spec: Spec, note: str = "",
+             previous: Proposal | None = None) -> Proposal:
+    user = (f"Brief:\n{brief.model_dump_json(indent=2)}\n\nSpec gốc:\n{spec.model_dump_json(indent=2)}"
+            f"\n\nTính năng cho phép:\n" + "\n".join(f"- {k}: {v}" for k, v in FEATURES.items()))
+    if note:
+        user += f"\n\nGóp ý của Sếp về các phương án lần trước:\n{note}"
+        if previous:
+            user += f"\n\nPhương án lần trước:\n{previous.model_dump_json(indent=2)}"
+    out = llm.structured("proposer", prompt("proposer"), user, Proposal)
+    if out is None:
+        out = _mock_proposal(brief, spec, note)
+    return _normalize_proposal(out)
+
+
+def _mock_proposal(brief: Brief, spec: Spec, note: str) -> Proposal:
+    hero = spec.sections[0]
+    contact = next(s for s in spec.sections if s.id == "contact")
+    middle = [s for s in spec.sections if s.id not in ("hero", "contact")]
+    gallery = Section(id="gallery", heading="Hình ảnh", purpose="Cho khách thấy không gian và sản phẩm",
+                      content=["[Ảnh không gian]", "[Ảnh sản phẩm nổi bật]", "[Ảnh đội ngũ]"])
+    faq = Section(id="faq", heading="Câu hỏi thường gặp", purpose="Giải đáp thắc mắc trước khi liên hệ",
+                  content=["Giờ mở cửa thế nào?", "Có giao hàng không?", "Có chỗ đỗ xe không?"])
+    budget = _budget_vnd(brief.budget)
+
+    def over(price: int) -> list[str]:
+        return [f"Vượt ngân sách khách nêu ({brief.budget})"] if budget and price > budget else []
+
+    a_price, b_price, c_price = 2_500_000, 5_000_000, 12_000_000
+    options = [
+        Option(id="A", tier="fast", name="Nhanh & rẻ",
+               summary="Trang ngắn 3 mục, đủ để khách biết và liên hệ.",
+               sections=[hero, *middle[:1], contact], features=["responsive"],
+               est_days=2, est_price_vnd=a_price,
+               pros=["Bàn giao nhanh nhất", "Chi phí thấp, dễ chốt"],
+               cons=["Ít nội dung tạo niềm tin", "Không có SEO cho chia sẻ mạng xã hội"] + over(a_price)),
+        Option(id="B", tier="balanced", name="Cân bằng",
+               summary="Đầy đủ các mục theo spec, có SEO cơ bản và menu dính.",
+               sections=list(spec.sections), features=["responsive", "sticky_nav", "seo_meta"],
+               est_days=5, est_price_vnd=b_price,
+               pros=["Đủ nội dung để chuyển đổi khách", "Chia sẻ lên Facebook/Zalo hiển thị đẹp"],
+               cons=["Cần khách cung cấp nội dung thật cho nhiều mục"] + over(b_price)),
+        Option(id="C", tier="premium", name="Cao cấp",
+               summary="Thêm thư viện ảnh, hỏi đáp, form liên hệ, giao diện tối và hiệu ứng.",
+               sections=[hero, *middle, gallery, faq, contact], features=list(FEATURES),
+               est_days=10, est_price_vnd=c_price,
+               pros=["Trải nghiệm chuyên nghiệp, nổi bật", "Form liên hệ giảm bước cho khách"],
+               cons=["Lâu và tốn kém hơn", "Cần ảnh chất lượng cao từ khách"] + over(c_price)),
+    ]
+    fitting = [o for o in options if not budget or o.est_price_vnd <= budget]
+    rec = "B" if any(o.id == "B" for o in fitting) else (fitting[-1].id if fitting else "A")
+    reasoning = (f"Phương án {rec} vừa ngân sách {brief.budget} và đủ để đạt mục tiêu."
+                 if budget else f"Chưa rõ ngân sách nên khuyên phương án {rec} để cân bằng chi phí và hiệu quả.")
+    if note:
+        reasoning += f" Đã ghi nhận góp ý của Sếp: {note}"
+    return Proposal(options=options, recommended=rec, reasoning=reasoning)
+
+
+def _normalize_proposal(p: Proposal) -> Proposal:
+    for o in p.options:
+        o.features = [f for f in o.features if f in FEATURES]
+        tmp = Spec(project_name="", page_title="", goal="", audience="", language="", sections=o.sections,
+                   cta_text="", palette=[], tech="", acceptance_criteria=[])
+        o.sections = _normalize_spec(tmp).sections
+        if "faq_accordion" in o.features and not any(s.id == "faq" for s in o.sections):
+            o.features.remove("faq_accordion")
+    if not p.get(p.recommended):
+        p.recommended = p.options[0].id
+    return p
+
+
+def apply_option(spec: Spec, option: Option) -> Spec:
+    """Final spec for the build: the analyst's spec narrowed/extended by the chosen option."""
+    final = spec.model_copy(deep=True)
+    final.sections = [s.model_copy() for s in option.sections]
+    final.features = list(option.features)
+    if not final.meta_description:
+        final.meta_description = spec.goal[:155]
+    final.acceptance_criteria = default_criteria() + [
+        f"Tính năng: {FEATURES[f]}" for f in option.features]
+    return final
+
 # --------------------------------------------------------------------------- Frontend Dev
 
 def frontend_dev(llm: LLM, spec: Spec, ws: RoleView, qa_failures: list[Check] | None = None,
@@ -160,30 +252,48 @@ def frontend_dev(llm: LLM, spec: Spec, ws: RoleView, qa_failures: list[Check] | 
 
 def _render_template(spec: Spec) -> CodeArtifact:
     e = html.escape
+    f = set(spec.features)
     bg, accent, light, dark = (spec.palette + ["#333", "#c80", "#fafafa", "#111"])[:4]
     blocks = []
     for i, sec in enumerate(spec.sections):
         items = "".join(f"<li>{e(c)}</li>" for c in sec.content)
+        reveal = ' class="reveal"' if "animations" in f else ""
         if i == 0:
             blocks.append(
                 f'<section id="{sec.id}" class="hero">\n  <div class="wrap">\n'
                 f"    <h1>{e(sec.heading)}</h1>\n    <p class=\"lead\">{e(sec.content[0] if sec.content else sec.purpose)}</p>\n"
                 f'    <a class="cta" href="#contact">{e(spec.cta_text)}</a>\n  </div>\n</section>')
+        elif sec.id == "faq" and "faq_accordion" in f:
+            qs = "".join(f"<details><summary>{e(c)}</summary><p>[Câu trả lời]</p></details>" for c in sec.content)
+            blocks.append(f'<section id="{sec.id}"{reveal}>\n  <div class="wrap">\n    <h2>{e(sec.heading)}</h2>\n'
+                          f"    {qs}\n  </div>\n</section>")
         elif sec.id == "contact":
+            form = ""
+            if "contact_form" in f:
+                form = ('\n    <form class="form" action="mailto:[email@khach.vn]" method="post" enctype="text/plain">'
+                        '<label>Họ tên<input name="name" required></label>'
+                        '<label>Số điện thoại<input name="phone" type="tel" required></label>'
+                        '<label>Lời nhắn<textarea name="message" rows="3"></textarea></label>'
+                        '<button type="submit">Gửi</button></form>')
             blocks.append(
-                f'<section id="{sec.id}">\n  <div class="wrap">\n    <h2>{e(sec.heading)}</h2>\n'
-                f"    <ul>{items}</ul>\n"
+                f'<section id="{sec.id}"{reveal}>\n  <div class="wrap">\n    <h2>{e(sec.heading)}</h2>\n'
+                f"    <ul>{items}</ul>{form}\n"
                 f'    <a class="cta" href="#contact">{e(spec.cta_text)}</a>\n  </div>\n</section>')
         else:
             blocks.append(
-                f'<section id="{sec.id}">\n  <div class="wrap">\n    <h2>{e(sec.heading)}</h2>\n'
+                f'<section id="{sec.id}"{reveal}>\n  <div class="wrap">\n    <h2>{e(sec.heading)}</h2>\n'
                 f"    <ul class=\"grid\">{items}</ul>\n  </div>\n</section>")
     nav = "".join(f'<a href="#{s.id}">{e(s.heading)}</a>' for s in spec.sections[1:])
+    seo = ""
+    if "seo_meta" in f:
+        seo = (f'\n<meta name="description" content="{e(spec.meta_description or spec.goal[:155])}">'
+               f'\n<meta property="og:title" content="{e(spec.page_title)}">'
+               f'\n<meta property="og:description" content="{e(spec.meta_description or spec.goal[:155])}">')
     page = f"""<!DOCTYPE html>
 <html lang="{e(spec.language)}">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1">{seo}
 <title>{e(spec.page_title)}</title>
 <link rel="stylesheet" href="styles.css">
 </head>
@@ -196,16 +306,16 @@ def _render_template(spec: Spec) -> CodeArtifact:
 </body>
 </html>
 """
-    css = f""":root {{ --bg: {bg}; --accent: {accent}; --light: {light}; --dark: {dark}; }}
+    css = f""":root {{ --bg: {bg}; --accent: {accent}; --light: {light}; --dark: {dark}; --card: #fff; --on-brand: {light}; --ink: {dark}; }}
 * {{ box-sizing: border-box; }}
 body {{ margin: 0; font-family: system-ui, -apple-system, "Segoe UI", sans-serif; color: var(--dark); background: var(--light); line-height: 1.6; }}
 .wrap {{ max-width: 1040px; margin: 0 auto; padding: 0 16px; }}
-.top {{ position: sticky; top: 0; background: var(--bg); color: var(--light); padding: 12px 0; z-index: 1; }}
+.top {{ {"position: sticky; top: 0; z-index: 1; " if "sticky_nav" in f else ""}background: var(--bg); color: var(--on-brand); padding: 12px 0; }}
 .top .wrap {{ display: flex; justify-content: space-between; align-items: center; gap: 12px; flex-wrap: wrap; }}
-.top nav a {{ color: var(--light); margin-left: 16px; text-decoration: none; font-size: 14px; }}
+.top nav a {{ color: var(--on-brand); margin-left: 16px; text-decoration: none; font-size: 14px; }}
 section {{ padding: 64px 0; }}
-section:nth-child(even) {{ background: #fff; }}
-.hero {{ background: var(--bg); color: var(--light); padding: 96px 0; text-align: center; }}
+section:nth-child(even) {{ background: var(--card); }}
+.hero {{ background: var(--bg); color: var(--on-brand); padding: 96px 0; text-align: center; }}
 .hero h1 {{ font-size: clamp(2rem, 6vw, 3.5rem); margin: 0 0 16px; }}
 .lead {{ font-size: 1.2rem; max-width: 640px; margin: 0 auto 32px; }}
 h2 {{ font-size: 1.8rem; margin-top: 0; }}
@@ -214,13 +324,27 @@ ul {{ padding-left: 20px; }}
 .grid li {{ background: var(--light); border-left: 4px solid var(--accent); padding: 16px; border-radius: 8px; }}
 .cta {{ display: inline-block; background: var(--accent); color: #fff; padding: 14px 28px; border-radius: 999px; text-decoration: none; font-weight: 600; }}
 .cta:hover {{ filter: brightness(1.1); }}
-footer {{ background: var(--dark); color: var(--light); padding: 24px 0; font-size: 14px; }}
-@media (max-width: 600px) {{ .top nav {{ display: none; }} section {{ padding: 48px 0; }} }}
+details {{ background: var(--light); border-radius: 8px; padding: 12px 16px; margin-bottom: 8px; }}
+summary {{ font-weight: 600; cursor: pointer; }}
+.form {{ display: grid; gap: 12px; max-width: 480px; margin: 16px 0 24px; }}
+.form label {{ display: grid; gap: 4px; font-weight: 600; }}
+.form input, .form textarea {{ font: inherit; padding: 10px; border: 1px solid #ccc; border-radius: 8px; }}
+.form button {{ justify-self: start; background: var(--dark); color: var(--light); border: 0; padding: 10px 20px; border-radius: 8px; font: inherit; }}
+footer {{ background: var(--ink); color: var(--on-brand); padding: 24px 0; font-size: 14px; }}
 """
+    if "responsive" in f:
+        css += "@media (max-width: 600px) { .top nav { display: none; } section { padding: 48px 0; } }\n"
+    if "dark_mode" in f:
+        css += ("@media (prefers-color-scheme: dark) {\n"
+                "  :root { --light: #171310; --dark: #efe6dc; --card: #211b16; }\n"
+                "  .form input, .form textarea { background: #211b16; color: var(--dark); border-color: #3a3029; }\n}\n")
+    if "animations" in f:
+        css += ("@keyframes rise { from { opacity: 0; transform: translateY(16px); } to { opacity: 1; transform: none; } }\n"
+                ".reveal { animation: rise .7s ease-out both; }\n"
+                "@media (prefers-reduced-motion: reduce) { .reveal { animation: none; } }\n")
     return CodeArtifact(files=[FileOut(path="index.html", content=page),
                                FileOut(path="styles.css", content=css)],
                         notes="Sinh từ template offline (chế độ mock).")
-
 
 # --------------------------------------------------------------------------- QA
 
@@ -265,6 +389,30 @@ class _Collector(HTMLParser):
 
 def _external(url: str) -> bool:
     return bool(re.match(r"^(https?:)?//", url.strip(), re.I))
+
+
+def _feature_checks(spec: Spec, ws: RoleView, src: str, tags: list[tuple[str, dict]]):
+    """Checks for the design features of the chosen option."""
+    css = src + "\n".join(ws.read(f) for f in ws.list_files() if f.endswith(".css"))
+    css_flat = re.sub(r"\s+", "", css.lower())
+    meta = lambda key, val: any(t == "meta" and a.get(key, "").lower() == val for t, a in tags)  # noqa: E731
+    rules = {
+        "responsive": ("@media" in css_flat, "CSS không có @media"),
+        "sticky_nav": ("position:sticky" in css_flat, "Không có position: sticky"),
+        "dark_mode": ("prefers-color-scheme:dark" in css_flat, "Không có @media (prefers-color-scheme: dark)"),
+        "animations": ("@keyframes" in css_flat and "prefers-reduced-motion" in css_flat,
+                       "Thiếu @keyframes hoặc chưa tôn trọng prefers-reduced-motion"),
+        "faq_accordion": (bool(re.search(r'<section[^>]*id="faq".*?<details', src, re.S)),
+                          "Mục #faq không dùng <details>"),
+        "contact_form": (bool(re.search(r'<section[^>]*id="contact".*?<form[^>]*action="mailto:', src, re.S)),
+                         "Mục #contact không có <form action=\"mailto:...\">"),
+        "seo_meta": (meta("name", "description") and meta("property", "og:title"),
+                     "Thiếu meta description hoặc og:title"),
+    }
+    for feat in spec.features:
+        if feat in rules:
+            ok, detail = rules[feat]
+            yield f"Tính năng: {FEATURES[feat]}", ok, detail
 
 
 def qa(spec: Spec, ws: RoleView) -> QAReport:
@@ -320,6 +468,9 @@ def qa(spec: Spec, ws: RoleView) -> QAReport:
         re.search(r"<button[^>]*>\s*" + re.escape(html.escape(spec.cta_text.strip(), quote=False)) + r"\s*</button>", src))
     add("Có nút CTA đúng chữ", cta_ok, f"Không có liên kết/nút với chữ '{spec.cta_text}'")
 
+    for name, ok, detail in _feature_checks(spec, ws, src, tags):
+        add(name, ok, detail)
+
     size = sum(len(ws.read(f).encode()) for f in ws.list_files())
     add("Tổng dung lượng < 300KB", size < 300_000, f"Tổng {size} byte")
 
@@ -329,8 +480,10 @@ def qa(spec: Spec, ws: RoleView) -> QAReport:
 # --------------------------------------------------------------------------- Reporter
 
 def reporter(llm: LLM, brief: Brief, spec: Spec, qa_report: QAReport, fix_rounds: int,
-             cost: dict, escalated: bool) -> FinalReport:
-    user = (f"Brief:\n{brief.model_dump_json(indent=2)}\n\nSpec (rút gọn): {spec.project_name}, "
+             cost: dict, escalated: bool, option: Option | None = None) -> FinalReport:
+    chosen = (f"Phương án sếp chọn: {option.id} - {option.name}, {option.est_days} ngày, "
+              f"{option.est_price_vnd:,} VND, tính năng: {', '.join(option.features)}\n\n") if option else ""
+    user = (f"Brief:\n{brief.model_dump_json(indent=2)}\n\n{chosen}Spec (rút gọn): {spec.project_name}, "
             f"{len(spec.sections)} mục: {', '.join(s.id for s in spec.sections)}\n\n"
             f"QA:\n{qa_report.model_dump_json(indent=2)}\n\nSố vòng sửa lỗi: {fix_rounds}\n"
             f"Đã vượt ngưỡng sửa lỗi tự động: {escalated}\nChi phí: {cost}")
@@ -348,9 +501,12 @@ def reporter(llm: LLM, brief: Brief, spec: Spec, qa_report: QAReport, fix_rounds
     if escalated:
         risks.insert(0, "Đã hết số lần sửa lỗi tự động, cần người xử lý")
     return FinalReport(
-        summary=(f"Đã làm xong landing page tĩnh cho {spec.project_name} với {len(spec.sections)} mục. "
+        summary=(f"Đã làm xong landing page tĩnh cho {spec.project_name} theo phương án "
+                 f"{option.id + ' (' + option.name + ')' if option else 'mặc định'}, {len(spec.sections)} mục. "
                  f"QA chạy {total} kiểm tra, {status} sau {fix_rounds} vòng sửa."),
         done=["Tiếp nhận và chuẩn hóa yêu cầu", "Viết spec và tiêu chí nghiệm thu",
+              *([f"Sếp chọn phương án {option.id}: {option.est_days:g} ngày, báo khách {option.est_price_vnd:,} VND"]
+                if option else []),
               "Code index.html + styles.css, commit vào repo dự án", f"QA {passed}/{total} kiểm tra đạt"],
         remaining=remaining,
         risks=risks,
