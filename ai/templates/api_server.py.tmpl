@@ -1,0 +1,128 @@
+"""Backend for the landing page. Standard library only.
+
+Serves the static site from the project root and the API endpoints below.
+Run:  python api/server.py --port 8080
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import threading
+import time
+from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from urllib.parse import parse_qs
+
+ROOT = Path(__file__).resolve().parent.parent
+DATA = Path(__file__).resolve().parent / "data"
+MAX_BODY = 16 * 1024
+_lock = threading.Lock()
+
+# Contract from the Architect: path -> fields
+ENDPOINTS = __ENDPOINTS__
+
+PATTERNS = {
+    "email": re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$"),
+    "phone": re.compile(r"^\+?[0-9 .()-]{8,20}$"),
+}
+
+
+def validate(fields: list[dict], data: dict) -> tuple[dict, list[str]]:
+    clean, errors = {}, []
+    for f in fields:
+        value = str(data.get(f["name"], "")).strip()
+        if not value:
+            if f["required"]:
+                errors.append(f"{f['name']}: bắt buộc")
+            continue
+        if len(value) > f["max_length"]:
+            errors.append(f"{f['name']}: tối đa {f['max_length']} ký tự")
+            continue
+        pattern = PATTERNS.get(f["type"])
+        if pattern and not pattern.match(value):
+            errors.append(f"{f['name']}: không hợp lệ")
+            continue
+        clean[f["name"]] = value
+    return clean, errors
+
+
+class Handler(SimpleHTTPRequestHandler):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, directory=str(ROOT), **kwargs)
+
+    def log_message(self, fmt, *args):  # keep test output quiet
+        pass
+
+    def _blocked(self) -> bool:
+        parts = self.path.split("?")[0].strip("/").split("/")
+        return bool(parts) and parts[0] in ("api", ".git", ".vtd")
+
+    def do_GET(self):
+        if self._blocked():
+            self.send_error(404)
+            return
+        super().do_GET()
+
+    def do_HEAD(self):
+        if self._blocked():
+            self.send_error(404)
+            return
+        super().do_HEAD()
+
+    def _json(self, status: int, payload: dict) -> None:
+        body = json.dumps(payload, ensure_ascii=False).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_POST(self):
+        path = self.path.split("?")[0]
+        endpoint = ENDPOINTS.get(path)
+        if endpoint is None:
+            self._json(404, {"error": "not found"})
+            return
+        length = int(self.headers.get("Content-Length") or 0)
+        if length > MAX_BODY:
+            self._json(413, {"error": "payload too large"})
+            return
+        raw = self.rfile.read(length).decode("utf-8", errors="replace")
+        is_json = "application/json" in (self.headers.get("Content-Type") or "")
+        try:
+            data = json.loads(raw or "{}") if is_json else {k: v[0] for k, v in parse_qs(raw).items()}
+        except json.JSONDecodeError:
+            self._json(400, {"error": "invalid json"})
+            return
+        if not isinstance(data, dict):
+            self._json(400, {"error": "invalid body"})
+            return
+        clean, errors = validate(endpoint["fields"], data)
+        if errors:
+            self._json(400, {"error": "validation", "details": errors})
+            return
+        DATA.mkdir(exist_ok=True)
+        record = {"at": time.strftime("%Y-%m-%dT%H:%M:%S"), **clean}
+        with _lock, open(DATA / endpoint["store"], "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+        if is_json:
+            self._json(endpoint["success_status"], {"ok": True})
+        else:
+            self.send_response(303)
+            self.send_header("Location", "../?sent=1#sent")
+            self.end_headers()
+
+
+def make_server(port: int = 8080, host: str = "127.0.0.1") -> ThreadingHTTPServer:
+    return ThreadingHTTPServer((host, port), Handler)
+
+
+if __name__ == "__main__":
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--port", type=int, default=8080)
+    ap.add_argument("--host", default="127.0.0.1")
+    args = ap.parse_args()
+    srv = make_server(args.port, args.host)
+    print(f"Serving on http://{args.host}:{srv.server_port}")
+    srv.serve_forever()
