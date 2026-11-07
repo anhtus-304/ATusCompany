@@ -5,3 +5,5 @@ __pycache__/
 backend/data/
 workspace/projects/
 .pytest_cache/
+workspace/deploys/
+workspace/outbox/

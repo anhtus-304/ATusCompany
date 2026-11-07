@@ -67,3 +67,13 @@ aside input#client { margin-bottom: 4px; }
 #contact-form { max-width: 520px; }
 #contact-form input { flex: 1; width: auto; }
 @media (max-width: 760px) { .bar { flex-wrap: wrap; } .tabs { margin-left: 0; } .tbl { display: block; overflow-x: auto; } }
+section.box.warn { border-color: var(--warn); }
+.row.wrap { flex-wrap: wrap; }
+.row input.short, #budget-form input { width: 120px; flex: 0 0 auto; }
+#push-form input#repo { flex: 1; min-width: 180px; width: auto; }
+.mail { display: grid; gap: 6px; max-width: 720px; }
+.mail label { margin: 6px 0 0; }
+.mail .actions { margin-top: 8px; }
+.tbl th[scope], .tbl tbody th { white-space: nowrap; }
+@media (max-width: 760px) { .layout { grid-template-columns: minmax(0, 1fr); } }
+.tbl td a, .mail input { overflow-wrap: anywhere; }

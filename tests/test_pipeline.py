@@ -476,3 +476,165 @@ def test_first_pass_metric_drops_when_dev_needs_fixes(tmp_path, monkeypatch):
     assert m[("backend_dev", "first_pass")] == 0.0 and m[("backend_dev", "rounds")] == 2
     assert m[("frontend_dev", "first_pass")] == 1.0
     assert ("designer", "seconds") in m
+
+
+# ---------------------------------------------------------------- phase 5: delivery
+
+class _CountingSpender(_Spender):
+    calls: list[str] = []
+
+    def structured(self, agent, system, user, schema):
+        self.cost.check()
+        _CountingSpender.calls.append(agent)
+        self.cost.add(agent, "claude-opus-5-5", 1000, 1000)  # $0.024 per call
+        return None
+
+
+def test_budget_ceiling_waits_for_boss_then_resumes(tmp_path, monkeypatch):
+    c, appmod = _client(tmp_path, monkeypatch)
+    appmod.llm_factory = _CountingSpender
+    _CountingSpender.calls = []
+    pid = c.post("/api/projects", json={"message": MSG, "budget_usd": 0.03}).json()["id"]
+    p = _wait(c, pid)
+    assert p["status"] == "over_budget"
+    assert p["artifacts"]["budget_stop"]["half"] == "plan"
+    assert any("Cảnh báo" in e["text"] for e in p["events"]), "warned before stopping"
+    assert c.post(f"/api/projects/{pid}/budget", json={"approve": True, "add_usd": 0}).status_code == 400
+    r = c.post(f"/api/projects/{pid}/budget", json={"approve": True, "add_usd": 1.0, "note": "khách lớn"})
+    assert r.json()["budget_usd"] == 1.03
+    p = _wait(c, pid)
+    assert p["status"] == "awaiting_choice", p["events"][-3:]
+    assert _CountingSpender.calls.count("intake") == 1, "finished steps are reused, not paid for twice"
+    assert c.post(f"/api/projects/{pid}/budget", json={"approve": True, "add_usd": 1}).status_code == 409
+    kinds = [d["kind"] for d in c.get(f"/api/clients/{p['client']['id']}").json()["memory"]["decisions"]]
+    assert "budget" in kinds
+
+    pid2 = c.post("/api/projects", json={"message": MSG, "budget_usd": 0.01}).json()["id"]
+    _wait(c, pid2)
+    assert c.post(f"/api/projects/{pid2}/budget", json={"approve": False}).json()["status"] == "stopped"
+
+
+def test_build_half_resumes_after_budget_stop(tmp_path):
+    from ai.orchestrator import resume_project
+    sink = MemSink()
+    assert run_project("p9", MSG, sink, tmp_path, budget_usd=0.08, llm_factory=_Spender) == "over_budget"
+    assert sink.artifacts["budget_stop"]["half"] == "build"
+    assert resume_project("p9", sink, tmp_path, 5.0, _Spender) == "awaiting_approval"
+    assert not sink.artifacts["budget_stop"]
+
+
+def test_revision_not_counted_twice_after_budget_stop(tmp_path):
+    from ai.orchestrator import resume_project
+    sink = MemSink()
+    plan_project("p10", MSG, sink, 0.08, _Spender)  # 3 calls = $0.072
+    assert revise_options("p10", "rẻ hơn", sink, 0.07, _Spender) == "over_budget"
+    assert sink.artifacts["revisions"]["notes"] == []
+    assert resume_project("p10", sink, tmp_path, 1.0, _Spender) == "awaiting_choice"
+    assert sink.artifacts["revisions"]["notes"] == ["rẻ hơn"]
+
+
+def _approved_premium(c, pid):
+    _wait(c, pid)
+    c.post(f"/api/projects/{pid}/choice", json={"option_id": "C"})
+    p = _wait(c, pid)
+    assert p["status"] == "awaiting_approval"
+    return p
+
+
+def test_staging_production_and_form_posts(tmp_path, monkeypatch):
+    c, appmod = _client(tmp_path, monkeypatch)
+    pid = c.post("/api/projects", json={"message": MSG}).json()["id"]
+    p = _approved_premium(c, pid)
+    staging = p["artifacts"]["delivery"]["staging"]
+    assert staging["url"].endswith(f"/staging/{pid}/")
+    assert "<html" in c.get(f"/staging/{pid}/").text
+    assert c.get(f"/staging/{pid}").status_code == 200  # redirect to the trailing slash
+    for private in ("api/server.py", "design/design.json", ".gitignore", "../../backend/app.py"):
+        assert c.get(f"/staging/{pid}/{private}").status_code == 404, private
+    assert c.get(f"/live/{pid}/").status_code == 404, "nothing in production yet"
+
+    # The contact form works on the deployed site and stores data outside the published folder.
+    r = c.post(f"/staging/{pid}/api/contact", data={"name": "Lan", "phone": "0901 234 567", "message": "Đặt bàn"},
+               follow_redirects=False)
+    assert r.status_code == 303 and r.headers["location"] == "../?sent=1#sent"
+    assert c.post(f"/staging/{pid}/api/contact", json={"name": "Lan"}).status_code == 400
+    assert c.post(f"/staging/{pid}/api/other", json={}).status_code == 404
+    stored = list((tmp_path / "deploys" / pid / "data" / "staging").glob("*.jsonl"))
+    assert stored and "Lan" in stored[0].read_text()
+    assert not (tmp_path / "deploys" / pid / "staging" / "api").exists()
+
+    # Production is a checkpoint: only after approval, only with confirmation.
+    assert c.post(f"/api/projects/{pid}/deploy", json={"confirm": True}).status_code == 409
+    c.post(f"/api/projects/{pid}/decision", json={"approve": True})
+    assert c.post(f"/api/projects/{pid}/deploy", json={"confirm": False}).status_code == 400
+    # A change after approval must not reach production.
+    (tmp_path / "ws" / pid / "index.html").write_text("<html>chưa duyệt</html>")
+    import subprocess
+    subprocess.run(["git", "-C", str(tmp_path / "ws" / pid), "commit", "-qam", "late change"], check=True,
+                   env={**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t", "GIT_COMMITTER_NAME": "t",
+                        "GIT_COMMITTER_EMAIL": "t@t"})
+    rec = c.post(f"/api/projects/{pid}/deploy", json={"confirm": True}).json()
+    assert rec["sha"] == staging["sha"]
+    live = c.get(f"/live/{pid}/").text
+    assert "chưa duyệt" not in live and "<html" in live
+    p = c.get(f"/api/projects/{pid}").json()
+    assert p["artifacts"]["delivery"]["production"]["sha"] == staging["sha"]
+    kinds = [d["kind"] for d in c.get(f"/api/clients/{p['client']['id']}").json()["memory"]["decisions"]]
+    assert "deployed" in kinds
+
+
+def test_client_message_needs_boss_and_hides_internals(tmp_path, monkeypatch):
+    c, _ = _client(tmp_path, monkeypatch)
+    pid = c.post("/api/projects", json={"message": MSG}).json()["id"]
+    p = _approved_premium(c, pid)
+    assert c.post(f"/api/projects/{pid}/client-message/send", json={"confirm": True}).status_code == 409
+    c.patch(f"/api/clients/{p['client']['id']}", json={"contact": "Chị Mai, 0901 111 222, mai@mocoffee.vn"})
+    c.post(f"/api/projects/{pid}/decision", json={"approve": True})
+    for _ in range(100):
+        draft = c.get(f"/api/projects/{pid}").json()["artifacts"].get("client_message")
+        if draft:
+            break
+        time.sleep(0.05)
+    assert draft["to"] == "mai@mocoffee.vn", "address taken from the client's contact"
+    assert f"/staging/{pid}/" in draft["body"]
+    for internal in ("$", "QA", "Reviewer", "commit", "vòng sửa"):
+        assert internal not in draft["body"], internal
+    assert not (tmp_path / "outbox").exists(), "nothing goes out on its own"
+
+    assert c.post(f"/api/projects/{pid}/client-message/send", json={"confirm": False}).status_code == 400
+    assert c.put(f"/api/projects/{pid}/client-message",
+                 json={"to": "không phải email", "subject": draft["subject"], "body": draft["body"]}).status_code == 200
+    assert c.post(f"/api/projects/{pid}/client-message/send", json={"confirm": True}).status_code == 400
+    c.put(f"/api/projects/{pid}/client-message",
+          json={"to": "mai@mocoffee.vn", "subject": "Bàn giao Mộc Coffee", "body": draft["body"] + "\nThêm lời chào."})
+    rec = c.post(f"/api/projects/{pid}/client-message/send", json={"confirm": True}).json()
+    assert rec["channel"] == "outbox" and rec["sent"] is False, "no SMTP configured: saved, not claimed as sent"
+    from email import message_from_bytes, policy
+    eml = message_from_bytes((tmp_path / "outbox" / rec["file"]).read_bytes(), policy=policy.default)
+    assert eml["To"] == "mai@mocoffee.vn" and eml["Subject"] == "Bàn giao Mộc Coffee"
+    assert "Thêm lời chào." in eml.get_content(), "the boss's edit is what goes out"
+
+
+def test_push_to_client_github(tmp_path, monkeypatch):
+    import subprocess
+    c, _ = _client(tmp_path, monkeypatch)
+    pid = c.post("/api/projects", json={"message": MSG}).json()["id"]
+    _approved_premium(c, pid)
+    body = {"repo": "mocoffee/website", "branch": "main", "confirm": True}
+    assert c.post(f"/api/projects/{pid}/github", json=body).status_code == 409, "approval first"
+    c.post(f"/api/projects/{pid}/decision", json={"approve": True})
+    r = c.post(f"/api/projects/{pid}/github", json=body)
+    assert r.status_code == 400 and "VTD_GITHUB_TOKEN" in r.json()["detail"]
+
+    remotes = tmp_path / "remotes"
+    subprocess.run(["git", "init", "-q", "--bare", str(remotes / "mocoffee" / "website.git")], check=True)
+    monkeypatch.setenv("VTD_GITHUB_URL", remotes.as_uri())
+    assert c.post(f"/api/projects/{pid}/github", json={**body, "repo": "../etc"}).status_code == 400
+    assert c.post(f"/api/projects/{pid}/github", json={**body, "branch": "-x"}).status_code == 400
+    rec = c.post(f"/api/projects/{pid}/github", json=body).json()
+    pushed = subprocess.run(["git", "-C", str(remotes / "mocoffee" / "website.git"), "rev-parse", "main"],
+                            capture_output=True, text=True).stdout.strip()
+    assert pushed == rec["sha"] == c.get(f"/api/projects/{pid}").json()["artifacts"]["delivery"]["approved_sha"]
+    files = subprocess.run(["git", "-C", str(remotes / "mocoffee" / "website.git"), "ls-tree", "-r", "--name-only",
+                            "main"], capture_output=True, text=True).stdout.split()
+    assert "index.html" in files and not any(f.startswith("api/data") for f in files)

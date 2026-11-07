@@ -23,7 +23,7 @@ class PastProject(BaseModel):
 
 
 class PastDecision(BaseModel):
-    kind: str  # choice | revision | approved | changes_requested | note
+    kind: str  # choice | revision | approved | changes_requested | note | budget | stopped | deployed | sent | pushed
     text: str
     date: str
 
@@ -243,6 +243,13 @@ class FinalReport(BaseModel):
     remaining: list[str]
     risks: list[str]
     decisions_needed: list[str]
+
+
+class ClientMessage(BaseModel):
+    """Báo cáo viên's message to the client. The boss edits and approves it before it is sent."""
+
+    subject: str = Field(description="Tiêu đề email, dưới 120 ký tự")
+    body: str = Field(description="Nội dung email gửi khách, văn bản thuần")
 
 
 TaskStatus = Literal["pending", "running", "done", "failed", "blocked"]

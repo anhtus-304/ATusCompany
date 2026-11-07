@@ -39,7 +39,8 @@ CREATE INDEX IF NOT EXISTS metrics_agent ON metrics(agent, name);
 """
 
 # Decision kinds that are remembered about a client.
-DECISION_KINDS = ("choice", "revision", "approved", "changes_requested", "note")
+DECISION_KINDS = ("choice", "revision", "approved", "changes_requested", "note",
+                  "budget", "stopped", "deployed", "sent", "pushed")
 
 
 class Store:
@@ -104,6 +105,12 @@ class Store:
 
     def set_status(self, pid: str, status: str) -> None:
         self._x("UPDATE projects SET status=?, updated_at=? WHERE id=?", (status, time.time(), pid))
+
+    def set_cost(self, pid: str, cost: dict) -> None:
+        self._x("UPDATE projects SET cost=?, updated_at=? WHERE id=?", (json.dumps(cost), time.time(), pid))
+
+    def set_budget(self, pid: str, budget_usd: float) -> None:
+        self._x("UPDATE projects SET budget_usd=?, updated_at=? WHERE id=?", (budget_usd, time.time(), pid))
 
     def transition(self, pid: str, expected: str, status: str) -> bool:
         """Atomically move from one status to another, so a double click can't start two runs."""

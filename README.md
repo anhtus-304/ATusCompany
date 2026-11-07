@@ -2,7 +2,8 @@
 
 Phòng công nghệ ảo chạy bằng AI. Sếp nhắn yêu cầu của khách, các agent tự tiếp nhận, viết spec, code, kiểm thử và gửi báo cáo kèm bản demo để sếp duyệt.
 
-**Trạng thái: Giai đoạn 4** — có bộ nhớ khách hàng, quyết định đã chốt và bảng điểm từng agent. Luồng làm việc:
+**Trạng thái: Giai đoạn 5** — giao hàng có kiểm soát: staging, deploy production, gửi email cho khách, đẩy code lên
+GitHub của khách, và duyệt chi thêm khi chạm trần ngân sách. Luồng làm việc:
 
 ```
 Sếp nhắn → Lễ tân (brief) → BA/Architect (spec) → Đề xuất 3 phương án
@@ -14,7 +15,9 @@ Sếp nhắn → Lễ tân (brief) → BA/Architect (spec) → Đề xuất 3 ph
         → QA            ┐ song song (cả hai chỉ đọc)
         → Reviewer      ┘
         → lỗi được trả đúng dev phụ trách file, tối đa VTD_MAX_FIX_ROUNDS vòng
-        → Báo cáo viên ⏸ Sếp duyệt gửi khách
+        → Báo cáo viên → tự deploy staging ⏸ Sếp duyệt bàn giao
+        → ⏸ Deploy production   ⏸ Gửi email cho khách   ⏸ Đẩy code lên GitHub của khách
+Chạm trần ngân sách ở bất kỳ bước nào ⏸ Sếp duyệt chi thêm (làm tiếp từ bước đó) hoặc dừng dự án
 ```
 
 **Ba phương án:** A Nhanh & rẻ (3 mục), B Cân bằng (theo spec, SEO, menu dính), C Cao cấp (thư viện ảnh, hỏi đáp,
@@ -53,6 +56,21 @@ tra của QA, tỷ lệ sếp duyệt. Số liệu này cũng gửi qua WebSocke
 riêng để đẩy lên GitHub của khách. Dữ liệu khách để lại qua form (`api/data/`) không bao giờ nằm trong gói
 và không xem được qua trang demo.
 
+**Giao hàng (giai đoạn 5).** Mọi bước ra bên ngoài đều cần sếp bấm và xác nhận; agent không có quyền deploy hay gửi.
+- *Staging*: build xong tự đăng bản chụp của commit vừa qua QA ở `/staging/<id>/`. Đây là link nội bộ để sếp xem.
+- *Production*: sau khi sếp duyệt, nút "Deploy production" đăng đúng commit sếp đã xem trên staging lên
+  `/live/<id>/`, kể cả khi repo dự án có commit mới hơn. Bản cũ được thay một lần, không có lúc trang trống.
+- Chỉ trang tĩnh được đăng: `api/`, `design/`, `.git` và dữ liệu khách không có trên staging hay production. Form
+  liên hệ trên trang đã đăng vẫn chạy: dữ liệu được kiểm theo API contract và lưu ngoài thư mục được phục vụ.
+- *Email cho khách*: duyệt xong, Báo cáo viên soạn email bàn giao (không có chi phí, QA, Reviewer hay chi tiết
+  nội bộ), lấy địa chỉ email từ thông tin liên hệ của khách. Sếp sửa, lưu, rồi bấm gửi. Có SMTP thì gửi thật;
+  chưa cấu hình thì lưu file `.eml` vào `workspace/outbox/` và giao diện ghi rõ là chưa gửi.
+- *GitHub của khách*: nhập `chủ-repo/tên-repo` và nhánh, hệ thống đẩy commit đã duyệt (không force-push).
+  Token lấy từ `VTD_GITHUB_TOKEN`, truyền qua biến môi trường của git, không nằm trong URL, lệnh hay nhật ký.
+- *Ngân sách*: dùng 80% trần thì nhật ký cảnh báo. Chạm trần thì dự án dừng ở trạng thái "Chạm trần ngân sách";
+  sếp nhập số USD cấp thêm để làm tiếp từ bước đang dừng (bước đã xong không chạy lại) hoặc dừng hẳn dự án.
+- Các quyết định này (chi thêm, dừng, deploy, gửi, giao code) được ghi vào bộ nhớ khách hàng.
+
 **Dashboard văn phòng pixel** (`dashboard/`, làm riêng) đọc luồng sự kiện realtime ở `ws://<host>/ws/events`
 theo hợp đồng trong `dashboard/src/types.ts`: `snapshot`, `agent`, `task`, `log`; gửi `{type: "assign", to, text}`
 để giao việc (tạo dự án mới). Server ở `backend/office.py`.
@@ -83,7 +101,7 @@ Test: `python -m pytest -q`
 | Thư mục | Nội dung |
 |---|---|
 | `frontend/` | Giao diện cho sếp: giao việc, task board theo agent, brief, spec, kết quả QA, báo cáo, xem demo, nút duyệt |
-| `backend/` | FastAPI + SQLite: dự án, task board, artifact, nhật ký, chi phí, hai điểm duyệt (chọn phương án, duyệt gửi khách), WebSocket `/ws/events` cho dashboard |
+| `backend/` | FastAPI + SQLite: dự án, task board, artifact, nhật ký, chi phí, các điểm duyệt, `delivery.py` (staging/production, email, GitHub), WebSocket `/ws/events` cho dashboard |
 | `ai/` | `agents.py` (các agent), `prompts/` (prompt từng vai), `artifacts.py` (schema giao tiếp), `team.py` (Designer, Backend Dev, QA chạy test, Reviewer), `templates/` (mẫu backend offline), `orchestrator.py` (luồng điều phối), `llm.py` (gọi model + trần ngân sách), `workspace.py` (quyền theo vai) |
 | `workspace/` | Mỗi dự án là một git repo riêng trong `workspace/projects/<id>/` |
 | `infra/` | Dockerfile, docker-compose, script chạy dev |
@@ -91,11 +109,11 @@ Test: `python -m pytest -q`
 ## Nguyên tắc đã áp dụng
 
 - **Giao tiếp bằng artifact có cấu trúc.** Mỗi agent nhận và trả về một model Pydantic (`Brief`, `Spec`, `CodeArtifact`, `QAReport`, `FinalReport`). Với model thật, output được ép đúng schema bằng structured outputs.
-- **Quyền tối thiểu.** Chỉ vai `frontend_dev` được ghi file; QA và Báo cáo viên chỉ đọc. Không agent nào deploy. Đường dẫn bị khóa trong thư mục dự án.
+- **Quyền tối thiểu.** Mỗi dev chỉ ghi được thư mục của mình; QA, Reviewer và Báo cáo viên chỉ đọc. Không agent nào deploy hay gửi gì ra ngoài (`backend/delivery.py` chỉ chạy từ nút của sếp). Đường dẫn bị khóa trong thư mục dự án.
 - **QA chạy kiểm tra thật** trên file: DOCTYPE, lang, meta, title, đủ section theo spec, đúng một h1, ảnh có alt, liên kết nội bộ, không tài nguyên ngoài, tài nguyên nội bộ tồn tại, nút CTA, dung lượng.
 - **Lỗi trả về dev, không đẩy cho sếp.** Quá `VTD_MAX_FIX_ROUNDS` vòng thì dự án chuyển sang "Cần sếp xử lý".
-- **Trần ngân sách mỗi dự án.** Theo dõi token và chi phí theo từng agent; chạm trần thì dừng và báo.
-- **Điểm dừng cho con người.** Kết thúc luôn ở trạng thái "Chờ sếp duyệt" trước khi gửi khách hay deploy.
+- **Trần ngân sách mỗi dự án.** Theo dõi token và chi phí theo từng agent; chạm trần thì dừng, chờ sếp duyệt chi thêm.
+- **Điểm dừng cho con người.** Chọn phương án, chi thêm tiền, duyệt bàn giao, deploy production, gửi khách, đẩy code: mỗi bước cần sếp bấm.
 - **Khóa API chỉ nằm trong biến môi trường.**
 
 ## Biến môi trường
@@ -111,6 +129,11 @@ Test: `python -m pytest -q`
 | `VTD_MAX_REVISIONS` | `3` | Số lần sếp được yêu cầu làm lại phương án |
 | `VTD_TEST_TIMEOUT` | `60` | Giới hạn giây khi QA chạy test backend |
 | `VTD_COMPANY` | `AtusCompany` | Tên công ty hiện trên dashboard |
+| `VTD_PUBLIC_URL` | `http://localhost:8000` | Địa chỉ công khai của máy chủ, dùng cho link staging/production |
+| `VTD_DEPLOYS` | `workspace/deploys` | Nơi lưu bản staging, production và dữ liệu form của trang đã đăng |
+| `VTD_GITHUB_TOKEN` | | Token GitHub (quyền ghi repo của khách) để đẩy code |
+| `VTD_SMTP_HOST`, `VTD_SMTP_PORT`, `VTD_SMTP_USER`, `VTD_SMTP_PASSWORD`, `VTD_SMTP_FROM` | | Máy chủ gửi email cho khách; bỏ trống thì email nằm trong hộp thư đi |
+| `VTD_OUTBOX` | `workspace/outbox` | Hộp thư đi khi chưa có SMTP |
 
 ## Lộ trình
 
@@ -118,4 +141,5 @@ Test: `python -m pytest -q`
 - [x] Giai đoạn 2: tạo 2–3 phương án (nhanh/rẻ, cân bằng, cao cấp) và cơ chế chọn
 - [x] Giai đoạn 3: tách frontend/backend, thêm QA chạy test thật, Reviewer bảo mật, UI/UX Designer, WebSocket cho dashboard
 - [x] Giai đoạn 4: bộ nhớ khách hàng và quyết định đã chốt, bảng điểm từng agent, gói giao khách
-- [ ] Tiếp theo: chạy thử với model thật và chỉnh prompt, đẩy thẳng lên GitHub của khách (cần token), dashboard pixel (luồng riêng)
+- [x] Giai đoạn 5: staging, deploy production, email bàn giao, đẩy code lên GitHub của khách, duyệt chi thêm ngân sách
+- [ ] Tiếp theo: chạy thử với model thật và chỉnh prompt, hosting ngoài (GitHub Pages, VPS), web nhiều trang có giỏ hàng và thanh toán
