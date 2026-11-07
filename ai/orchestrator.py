@@ -2,23 +2,28 @@
 
 plan_project:   message -> brief -> spec -> 3 options        -> pause "awaiting_choice"
 revise_options: boss feedback -> new options                  -> pause "awaiting_choice"
-build_project:  chosen option -> final spec -> code -> QA (fix loop) -> report
-                                                              -> pause "awaiting_approval"
+build_project:  chosen option -> final spec (+ API contract)
+                -> Designer || Backend Dev          (parallel: independent)
+                -> Frontend Dev                     (needs design + contract)
+                -> QA || Reviewer                   (parallel: both read-only)
+                -> failures routed to the owning dev, up to MAX_FIX_ROUNDS
+                -> report                           -> pause "awaiting_approval"
 
 The orchestrator owns sequencing and the task board. Agents only see the
-artifacts they need. QA failures go back to the dev, never straight to the
-boss, up to MAX_FIX_ROUNDS; past that the project is escalated.
+artifacts they need. QA and review failures go back to the dev who owns the
+file, never straight to the boss; past MAX_FIX_ROUNDS the project is escalated.
 """
 from __future__ import annotations
 
 import os
 import traceback
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Callable, Iterator, Protocol
 
-from . import agents
-from .artifacts import Brief, Proposal, Spec
+from . import agents, team
+from .artifacts import Brief, Check, Proposal, QAReport, Spec
 from .llm import BudgetExceeded, CostTracker, LLM, make_llm
 from .workspace import Workspace
 
@@ -30,8 +35,11 @@ STAGES = [
     ("analyst", "BA / Architect"),
     ("proposer", "Đề xuất phương án"),
     ("choice", "Sếp chọn"),
+    ("designer", "UI/UX Designer"),
+    ("backend_dev", "Backend Dev"),
     ("frontend_dev", "Frontend Dev"),
     ("qa", "QA"),
+    ("reviewer", "Reviewer"),
     ("reporter", "Báo cáo viên"),
 ]
 
@@ -149,32 +157,84 @@ def build_project(pid: str, option_id: str, sink: Sink, workspace_root: Path, bu
         r.save("final_spec", spec.model_dump())
 
         ws = Workspace(workspace_root, pid)
-        dev_view, qa_view = ws.for_role("frontend_dev"), ws.for_role("qa")
-        code, failures, rounds = None, None, 0
-        while True:
-            r.step("frontend_dev", "running", f"vòng {rounds + 1}")
-            code = agents.frontend_dev(r.llm, spec, dev_view, failures, code)
-            sha = ws.commit(f"frontend_dev: option {option.id}, round {rounds + 1}"
-                            + (" (fix QA)" if failures else ""))
-            r.step("frontend_dev", "done", f"commit {sha}" if sha else "không đổi")
+        views = {role: ws.for_role(role) for role in ("designer", "frontend_dev", "backend_dev", "qa", "reviewer")}
 
-            r.step("qa", "running", f"vòng {rounds + 1}")
-            report = agents.qa(spec, qa_view)
+        # 1. Designer and Backend Dev don't depend on each other: run in parallel.
+        def run_designer():
+            r.step("designer", "running")
+            d = team.designer(r.llm, spec, views["designer"])
+            r.save("design", d.model_dump())
+            r.step("designer", "done", f"{len(d.sections)} bố cục")
+            return d
+
+        def run_backend(failures=None, previous=None):
+            if not spec.api:
+                return None
+            r.step("backend_dev", "running", "sửa lỗi" if failures else ", ".join(e.path for e in spec.api))
+            out = team.backend_dev(r.llm, spec, views["backend_dev"], failures, previous)
+            r.step("backend_dev", "done", f"{len(out.files)} file")
+            return out
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            fut_design, fut_backend = pool.submit(run_designer), pool.submit(run_backend)
+            design, backend_code = fut_design.result(), fut_backend.result()
+        if not spec.api:
+            r.step("backend_dev", "done", "không cần backend")
+
+        # 2. Frontend needs the design and the API contract.
+        front_code, front_fail, back_fail, rounds = None, None, None, 0
+        need_front = True
+        while True:
+            if need_front:
+                r.step("frontend_dev", "running", f"vòng {rounds + 1}")
+                front_code = agents.frontend_dev(r.llm, spec, views["frontend_dev"], front_fail, front_code, design)
+                r.step("frontend_dev", "done")
+            if back_fail:
+                backend_code = run_backend([f"{c.name}: {c.detail}" for c in back_fail], backend_code)
+            sha = ws.commit(f"option {option.id}, round {rounds + 1}" + (" (fixes)" if rounds else ""))
+            sink.event(pid, f"Commit {sha}" if sha else "Không có thay đổi để commit")
+
+            # 3. QA and Reviewer are read-only: run in parallel.
+            def run_qa():
+                r.step("qa", "running", f"vòng {rounds + 1}")
+                rep = agents.qa(spec, views["qa"])
+                rep.checks += team.backend_checks(spec, views["qa"])
+                rep.passed = all(c.passed for c in rep.checks)
+                return rep
+
+            def run_review():
+                r.step("reviewer", "running", f"vòng {rounds + 1}")
+                return team.reviewer(r.llm, spec, views["reviewer"])
+
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                fq, fr = pool.submit(run_qa), pool.submit(run_review)
+                report, review = fq.result(), fr.result()
             r.save("qa", report.model_dump())
-            if report.passed:
-                r.step("qa", "done", f"{len(report.checks)}/{len(report.checks)} đạt")
+            r.save("review", review.model_dump() | {"passed": review.passed})
+            r.step("qa", "done" if report.passed else "failed",
+                   f"{sum(c.passed for c in report.checks)}/{len(report.checks)} đạt")
+            r.step("reviewer", "done" if review.passed else "failed",
+                   f"{len(review.blocking())} lỗi chặn, {len(review.findings)} ghi chú")
+            if report.passed and review.passed:
                 break
-            failures = report.failures()
-            sink.event(pid, f"QA trả {len(failures)} lỗi về cho dev")
+
+            # Route every failure to the dev who owns it.
+            issues = report.failures() + [
+                Check(name=f"Review {f.rule} ({f.file})", passed=False, detail=f.message, owner=f.owner)
+                for f in review.blocking()]
+            front_fail = [c for c in issues if c.owner == "frontend_dev"]
+            back_fail = [c for c in issues if c.owner == "backend_dev"]
+            need_front = bool(front_fail)
+            sink.event(pid, f"Trả {len(front_fail)} lỗi cho Frontend, {len(back_fail)} lỗi cho Backend")
             if rounds >= MAX_FIX_ROUNDS:
-                r.step("qa", "blocked", f"vượt {MAX_FIX_ROUNDS} vòng sửa, cần sếp")
+                stage = "qa" if not report.passed else "reviewer"
+                r.step(stage, "blocked", f"vượt {MAX_FIX_ROUNDS} vòng sửa, cần sếp")
                 break
-            r.step("qa", "failed", f"{len(failures)} lỗi, trả về dev")
             rounds += 1
 
-        escalated = not report.passed
+        escalated = not (report.passed and review.passed)
         r.step("reporter", "running")
-        final = agents.reporter(r.llm, brief, spec, report, rounds, r.cost.to_dict(), escalated, option)
+        final = agents.reporter(r.llm, brief, spec, report, rounds, r.cost.to_dict(), escalated, option, review)
         r.save("report", final.model_dump())
         r.save("git", {"log": ws.log(), "path": str(ws.dir)})
         r.step("reporter", "done")

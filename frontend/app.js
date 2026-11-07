@@ -83,9 +83,28 @@ function render(p) {
       <p><a href="/preview/${esc(p.id)}/" target="_blank">Mở trong tab mới</a></p>
       <iframe src="/preview/${esc(p.id)}/index.html?t=${Date.now()}" title="Bản demo"></iframe></section>`;
   }
+  if (a.review) {
+    const f = a.review.findings || [];
+    const SEV = { blocker: "Chặn", major: "Nặng", minor: "Gợi ý" };
+    html += `<section class="box"><h3>Reviewer</h3>${f.length ? `<ul class="checks">${f.map((x) =>
+      `<li><span class="${x.severity === "minor" ? "blocked" : "failed"}">${esc(SEV[x.severity] || x.severity)}</span>
+       <code>${esc(x.file)}</code> ${esc(x.message)} <span class="muted small">(${esc(x.rule)}, giao ${esc(x.owner)})</span></li>`).join("")}</ul>`
+      : '<p class="done">Không có vấn đề bảo mật hay chất lượng.</p>'}</section>`;
+  }
+  if (a.design) {
+    const d = a.design;
+    html += `<section class="box"><h3>Thiết kế</h3><div class="chips">${Object.entries(d.colors).map(([k, v]) =>
+      `<span class="chip"><span class="sw" style="background:${esc(v)}"></span>${esc(k)} ${esc(v)}</span>`).join("")}</div>
+      <p class="small muted">Font: ${esc(d.font_stack)} · Bố cục: ${d.sections.map((x) => `#${esc(x.id)} ${esc(x.layout)}`).join(", ")}</p>
+      ${list(d.notes)}</section>`;
+  }
+  if (a.final_spec && a.final_spec.api && a.final_spec.api.length) {
+    html += `<section class="box"><h3>API contract</h3>${a.final_spec.api.map((e) => `<p><code>${esc(e.method)} ${esc(e.path)}</code> ${esc(e.purpose)}</p>
+      <ul>${e.fields.map((x) => `<li><code>${esc(x.name)}</code> ${esc(x.type)}${x.required ? ", bắt buộc" : ""}, tối đa ${x.max_length}</li>`).join("")}</ul>`).join("")}</section>`;
+  }
   if (a.qa) {
     html += `<section class="box"><h3>QA</h3><ul class="checks">${a.qa.checks.map((c) =>
-      `<li><span class="${c.passed ? "done" : "failed"}">${c.passed ? "✓" : "✗"}</span> ${esc(c.name)}
+      `<li><span class="${c.passed ? "done" : "failed"}">${c.passed ? "✓" : "✗"}</span> ${esc(c.name)}${c.owner === "backend_dev" ? ' <span class="chip">backend</span>' : ""}
        ${c.detail ? `<span class="muted small">: ${esc(c.detail)}</span>` : ""}</li>`).join("")}</ul></section>`;
   }
   if (a.proposal && p.status !== "awaiting_choice") html += renderOptions(p);

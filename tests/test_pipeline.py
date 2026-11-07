@@ -76,7 +76,7 @@ def test_fix_loop_then_escalate(tmp_path, monkeypatch):
     """A dev that never fixes the bug is stopped after MAX_FIX_ROUNDS and escalated."""
     calls = []
 
-    def bad_dev(llm, spec, ws, failures=None, previous=None):
+    def bad_dev(llm, spec, ws, failures=None, previous=None, design=None):
         calls.append(failures)
         art = CodeArtifact(files=[FileOut(path="index.html", content="<p>broken</p>")], notes="")
         ws.write("index.html", art.files[0].content + str(len(calls)))
@@ -197,3 +197,156 @@ def test_cost_carries_across_halves(tmp_path):
     first = sink.artifacts["cost"]["calls"]
     build_project("p10", "A", sink, tmp_path, llm_factory=lambda c: _Spender(c))
     assert sink.artifacts["cost"]["calls"] > first
+
+
+# ---------------------------------------------------------------- phase 3
+
+from ai import team  # noqa: E402
+from ai.artifacts import Spec  # noqa: E402
+
+
+def _built(tmp_path, option_id, pid):
+    sink = MemSink()
+    plan_project(pid, MSG, sink)
+    status = build_project(pid, option_id, sink, tmp_path)
+    return sink, status
+
+
+def test_premium_has_backend_tested_for_real(tmp_path):
+    sink, status = _built(tmp_path, "C", "p11")
+    assert status == "awaiting_approval"
+    spec = sink.artifacts["final_spec"]
+    assert [e["path"] for e in spec["api"]] == ["/api/contact"]
+    names = [c["name"] for c in sink.artifacts["qa"]["checks"] if c["owner"] == "backend_dev"]
+    assert any(n.startswith("Test backend chạy và đạt (7 test)") for n in names), names
+    assert "POST /api/contact nhận dữ liệu hợp lệ" in names
+    assert "Không lộ mã nguồn backend qua HTTP" in names
+    assert "Form khớp API contract" in [c["name"] for c in sink.artifacts["qa"]["checks"]]
+    assert (tmp_path / "p11" / "design" / "design.json").exists()
+    assert sink.tasks["designer"] == "done" and sink.tasks["reviewer"] == "done"
+
+
+def test_static_option_skips_backend(tmp_path):
+    sink, status = _built(tmp_path, "B", "p12")
+    assert status == "awaiting_approval"
+    assert not sink.artifacts["final_spec"]["api"]
+    assert not (tmp_path / "p12" / "api").exists()
+
+
+def test_role_write_scopes(tmp_path):
+    ws = Workspace(tmp_path, "p13")
+    with pytest.raises(PermissionDenied):
+        ws.for_role("frontend_dev").write("api/server.py", "x")
+    with pytest.raises(PermissionDenied):
+        ws.for_role("backend_dev").write("index.html", "x")
+    with pytest.raises(PermissionDenied):
+        ws.for_role("designer").write("styles.css", "x")
+    with pytest.raises(PermissionDenied):
+        ws.for_role("reviewer").write("design/x.json", "x")
+    ws.for_role("backend_dev").write("api/server.py", "x")
+    ws.for_role("designer").write("design/design.json", "{}")
+
+
+def test_reviewer_flags_planted_problems(tmp_path):
+    ws = Workspace(tmp_path, "p14")
+    ws.for_role("backend_dev").write("api/server.py", 'API_KEY = "sk-abcdefghijklmnopqrstuvwxyz"\nexec(body)\n')
+    ws.for_role("frontend_dev").write("index.html", '<a href="javascript:alert(1)" onclick="x()">x</a>')
+    spec = Spec(project_name="x", page_title="x", goal="x", audience="x", language="vi", sections=[],
+                cta_text="x", palette=[], tech="x", acceptance_criteria=[])
+    review = team.reviewer(MockLLM(CostTracker(1)), spec, ws.for_role("reviewer"))
+    rules = {(f.rule, f.owner) for f in review.findings}
+    assert {("hardcoded-secret", "backend_dev"), ("no-eval", "backend_dev"),
+            ("javascript-url", "frontend_dev"), ("inline-handler", "frontend_dev")} <= rules
+    assert not review.passed
+
+
+def test_backend_failures_go_to_backend_dev_only(tmp_path, monkeypatch):
+    real_backend = team.backend_dev
+    front_calls, back_calls = [], []
+
+    def broken_backend(llm, spec, ws, failures=None, previous=None):
+        back_calls.append(failures)
+        out = real_backend(llm, spec, ws, failures, previous)
+        if not failures:  # first version leaks the API source and has no input limits
+            ws.write("api/server.py", ws.read("api/server.py").replace('parts[0] in ("api", ".git", ".vtd")', "False"))
+        return out
+
+    real_front = agents.frontend_dev
+
+    def counting_front(*a, **k):
+        front_calls.append(1)
+        return real_front(*a, **k)
+
+    monkeypatch.setattr(team, "backend_dev", broken_backend)
+    monkeypatch.setattr(agents, "frontend_dev", counting_front)
+    sink, status = _built(tmp_path, "C", "p15")
+    assert status == "awaiting_approval"
+    assert len(back_calls) == 2 and back_calls[1], "backend got its failures back"
+    assert len(front_calls) == 1, "frontend was not re-run for a backend bug"
+
+
+def test_designer_enforces_contrast(tmp_path):
+    from ai.artifacts import DesignSpec, SectionDesign
+
+    class BadDesigner(MockLLM):
+        def structured(self, agent, system, user, schema):
+            return DesignSpec(colors={"surface": "#ffffff", "ink": "#eeeeee"}, font_stack="x", radius_px=4,
+                              max_width_px=900, sections=[SectionDesign(id="hero", layout="grid")], notes=[])
+
+    spec = agents.analyst(MockLLM(CostTracker(1)), agents.intake(MockLLM(CostTracker(1)), MSG))
+    d = team.designer(BadDesigner(CostTracker(1)), spec, Workspace(tmp_path, "p16").for_role("designer"))
+    assert team.contrast(d.colors["ink"], d.colors["surface"]) >= 4.5
+    assert [s.id for s in d.sections] == [s.id for s in spec.sections]
+    assert d.sections[0].layout == "hero"
+
+
+def test_websocket_office_feed(tmp_path, monkeypatch):
+    monkeypatch.setenv("VTD_WORKSPACE", str(tmp_path / "ws"))
+    monkeypatch.setenv("VTD_DB", str(tmp_path / "db.sqlite3"))
+    import importlib
+
+    import backend.app as appmod
+    importlib.reload(appmod)
+    from fastapi.testclient import TestClient
+
+    c = TestClient(appmod.app)
+    with c.websocket_connect("/ws/events") as ws:
+        snap = ws.receive_json()
+        assert snap["type"] == "snapshot" and snap["company"]
+        assert {a["group"] for a in snap["agents"]} == {"lead", "code", "creative"}
+        assert all(a["status"] == "idle" for a in snap["agents"])
+        ws.send_json({"type": "assign", "to": "leader", "text": MSG})
+        seen = []
+        while True:
+            msg = ws.receive_json()
+            seen.append(msg)
+            if msg["type"] == "task" and msg["task"]["status"] == "review":
+                break
+        kinds = {m["type"] for m in seen}
+        assert {"log", "agent", "task"} <= kinds
+        assert seen[0] == {"type": "log", "entry": seen[0]["entry"]} and seen[0]["entry"]["kind"] == "assign"
+        task = seen[-1]["task"]
+        assert task["id"].startswith("TD-") and task["assignee"] == "leader"
+        assert set(task) >= {"id", "title", "description", "assigner", "assignee", "status", "files",
+                             "createdAt", "updatedAt"}
+        working = [m["agent"] for m in seen if m["type"] == "agent" and m["agent"].get("status") == "working"]
+        assert {"intake", "architect"} <= {a["id"] for a in working}
+        assert all(a["status"] in ("idle", "working", "blocked") for m in seen if m["type"] == "agent"
+                   for a in [m["agent"]] if "status" in a)
+
+    pid = c.get("/api/projects").json()[0]["id"]
+    assert c.post(f"/api/projects/{pid}/choice", json={"option_id": "C"}).status_code == 200
+    for _ in range(100):
+        if c.get(f"/api/projects/{pid}").json()["status"] != "running":
+            break
+        time.sleep(0.1)
+    with c.websocket_connect("/ws/events") as ws:
+        snap = ws.receive_json()
+        tasks = {t["assignee"]: t for t in snap["tasks"]}
+        assert tasks["backend"]["status"] == "done" and tasks["backend"]["files"]
+        assert tasks["reviewer"]["status"] == "done"
+
+
+def test_qa_does_not_touch_project_data(tmp_path):
+    _built(tmp_path, "C", "p17")
+    assert not (tmp_path / "p17" / "api" / "data").exists()

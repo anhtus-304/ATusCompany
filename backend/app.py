@@ -6,6 +6,7 @@ GET  /api/projects/{id}       task board, artifacts, events, cost
 POST /api/projects/{id}/choice     pick an option, or send feedback to revise them (checkpoint 1)
 POST /api/projects/{id}/decision   approve / reject the delivery (checkpoint 2)
 GET  /preview/{id}/{path}     serve the generated site from the workspace
+WS   /ws/events               live office feed for the pixel dashboard (see backend/office.py)
 """
 from __future__ import annotations
 
@@ -13,7 +14,9 @@ import os
 import threading
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException
+import asyncio
+
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -25,9 +28,14 @@ WORKSPACE = Path(os.environ.get("VTD_WORKSPACE", ROOT / "workspace" / "projects"
 DB_PATH = Path(os.environ.get("VTD_DB", ROOT / "backend" / "data" / "vtd.sqlite3"))
 DEFAULT_BUDGET = float(os.environ.get("VTD_DEFAULT_BUDGET_USD", "2.0"))
 
+COMPANY = os.environ.get("VTD_COMPANY", "AtusCompany")
+
+from .office import Office, OfficeSink  # noqa: E402
 from .store import Store  # noqa: E402
 
 store = Store(DB_PATH)
+office = Office()
+sink = OfficeSink(store, office)
 app = FastAPI(title="Virtual Tech Dept")
 
 
@@ -48,10 +56,17 @@ class Decision(BaseModel):
 
 @app.post("/api/projects")
 def create_project(body: NewProject) -> dict:
-    budget = body.budget_usd or DEFAULT_BUDGET
-    pid = store.create(body.message, budget)
-    _bg(plan_project, pid, body.message, store, budget)
-    return {"id": pid}
+    return {"id": start_project(body.message, body.budget_usd)}
+
+
+def start_project(message: str, budget_usd: float | None = None, assignee: str = "leader") -> str:
+    budget = budget_usd or DEFAULT_BUDGET
+    pid = store.create(message, budget)
+    if assignee not in office.agents:
+        assignee = "leader"
+    office.add_log(assignee, "assign", f"Sếp giao việc: {message[:120]}")
+    _bg(plan_project, pid, message, sink, budget)
+    return pid
 
 
 def _bg(fn, *args) -> None:
@@ -72,13 +87,13 @@ def choose(pid: str, body: Choice) -> dict:
         if not store.transition(pid, "awaiting_choice", "running"):
             raise HTTPException(409, "Dự án vừa được xử lý")
         store.event(pid, f"Sếp chọn phương án {body.option_id}")
-        _bg(build_project, pid, body.option_id, store, WORKSPACE, p["budget_usd"])
+        _bg(build_project, pid, body.option_id, sink, WORKSPACE, p["budget_usd"])
         return {"status": "running", "action": "build"}
     if not body.note.strip():
         raise HTTPException(400, "Cần chọn một phương án hoặc ghi góp ý")
     if not store.transition(pid, "awaiting_choice", "running"):
         raise HTTPException(409, "Dự án vừa được xử lý")
-    _bg(revise_options, pid, body.note.strip(), store, p["budget_usd"])
+    _bg(revise_options, pid, body.note.strip(), sink, p["budget_usd"])
     return {"status": "running", "action": "revise"}
 
 
@@ -120,6 +135,35 @@ def preview(pid: str, path: str = "") -> FileResponse:
 @app.get("/preview/{pid}")
 def preview_root(pid: str) -> RedirectResponse:
     return RedirectResponse(f"/preview/{pid}/index.html")
+
+
+@app.websocket("/ws/events")
+async def ws_events(ws: WebSocket) -> None:
+    await ws.accept()
+    queue = office.subscribe()
+    try:
+        await ws.send_json(office.snapshot(COMPANY))
+
+        async def pump() -> None:
+            while True:
+                await ws.send_json(await queue.get())
+
+        sender = asyncio.create_task(pump())
+        try:
+            while True:
+                msg = await ws.receive_json()
+                if isinstance(msg, dict) and msg.get("type") == "assign":
+                    text = str(msg.get("text", "")).strip()
+                    if 5 <= len(text) <= 5000:
+                        start_project(text, assignee=str(msg.get("to") or "leader"))
+                    else:
+                        office.add_log(None, "error", "Nội dung giao việc phải từ 5 đến 5000 ký tự")
+        finally:
+            sender.cancel()
+    except (WebSocketDisconnect, RuntimeError, ValueError):
+        pass
+    finally:
+        office.unsubscribe(queue)
 
 
 app.mount("/", StaticFiles(directory=ROOT / "frontend", html=True), name="frontend")
