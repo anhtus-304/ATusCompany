@@ -28,6 +28,7 @@ from pathlib import Path
 
 import asyncio
 import io
+import json
 import re
 import subprocess
 import time
@@ -144,12 +145,26 @@ def _bg(fn, *args) -> None:
     threading.Thread(target=fn, args=args, daemon=True).start()
 
 
+class _StagingSink:
+    """Deploys staging before the project shows as ready, so the boss never sees a missing demo link."""
+
+    def __init__(self, inner):
+        self.inner = inner
+
+    def __getattr__(self, name):
+        return getattr(self.inner, name)
+
+    def finish(self, pid: str, status: str, cost: dict) -> None:
+        _after_build(pid, status)
+        self.inner.finish(pid, status, cost)
+
+
 def _build(pid: str, option_id: str, budget: float) -> None:
-    _after_build(pid, build_project(pid, option_id, sink, WORKSPACE, budget, _llm))
+    build_project(pid, option_id, _StagingSink(sink), WORKSPACE, budget, _llm)
 
 
 def _resume(pid: str, budget: float) -> None:
-    _after_build(pid, resume_project(pid, sink, WORKSPACE, budget, _llm))
+    resume_project(pid, _StagingSink(sink), WORKSPACE, budget, _llm)
 
 
 def _after_build(pid: str, status: str) -> None:
@@ -319,6 +334,35 @@ def push_github(pid: str, body: PushRequest) -> dict:
     return rec
 
 
+def _shop_admin(pid: str) -> dict:
+    p = _require(pid)
+    spec = p["artifacts"].get("final_spec") or {}
+    if spec.get("kind") != "shop" or "admin_orders" not in spec.get("features", []):
+        raise HTTPException(404, "Dự án không có trang quản lý đơn")
+    return p
+
+
+@app.get("/api/projects/{pid}/admin-token")
+def shop_admin_token(pid: str) -> dict:
+    """The access code the boss hands to the client for admin.html. Only after approval."""
+    _shop_admin(pid)
+    store.event(pid, "Sếp xem mã truy cập trang quản lý đơn")
+    return {"token": delivery.admin_token(pid)}
+
+
+@app.get("/api/projects/{pid}/orders")
+def shop_orders(pid: str, env: Literal["staging", "production"] = "production") -> dict:
+    """Orders on the deployed shop, read through the shop's own admin API."""
+    _shop_admin(pid)
+    if delivery.site_file(pid, env, "") is None:
+        return {"env": env, "deployed": False, "orders": []}
+    status, _, body = delivery.proxy(pid, env, "GET", "admin/orders", "", b"",
+                                     {"authorization": f"Bearer {delivery.admin_token(pid)}"})
+    if status != 200:
+        raise HTTPException(502, f"Backend của shop trả {status}")
+    return {"env": env, "deployed": True, "orders": json.loads(body).get("orders", [])}
+
+
 class _NoModel:
     """Used when the budget is spent: agents fall back to their templates without a model call."""
 
@@ -402,18 +446,24 @@ def _serve_site(env: str, pid: str, path: str) -> Response:
     return FileResponse(f)
 
 
-async def _site_form(env: str, pid: str, path: str, request: Request) -> Response:
-    """Form posts on a deployed site, checked against the Architect's API contract."""
+async def _site_api(env: str, pid: str, path: str, request: Request) -> Response:
+    """API calls on a deployed site go to that commit's own backend, running on a private port."""
     if not re.fullmatch(r"[\w-]{1,80}", pid) or delivery.site_file(pid, env, "") is None:
         raise HTTPException(404)
-    spec = store.load(pid, "final_spec") or {}
-    endpoint = next((e for e in spec.get("api", []) if e["method"] == "POST" and e["path"] == "/" + path), None)
-    if endpoint is None:
-        return JSONResponse({"error": "not found"}, 404)
-    status, payload = delivery.submit(pid, env, endpoint, await request.body(), request.headers.get("content-type", ""))
-    if status == 303:
-        return RedirectResponse(payload["redirect"], status_code=303)
-    return JSONResponse(payload, status)
+    status, headers, body = delivery.proxy(pid, env, request.method, path, request.url.query,
+                                           await request.body(), dict(request.headers))
+    return Response(body, status, headers={k: v for k, v in headers.items() if k != "content-type"},
+                    media_type=headers.get("content-type"))
+
+
+@app.api_route("/staging/{pid}/api/{path:path}", methods=["GET", "POST"], include_in_schema=False)
+async def staging_api(pid: str, path: str, request: Request) -> Response:
+    return await _site_api("staging", pid, path, request)
+
+
+@app.api_route("/live/{pid}/api/{path:path}", methods=["GET", "POST"], include_in_schema=False)
+async def live_api(pid: str, path: str, request: Request) -> Response:
+    return await _site_api("production", pid, path, request)
 
 
 @app.get("/staging/{pid}/{path:path}", include_in_schema=False)
@@ -424,16 +474,6 @@ def staging_site(pid: str, path: str = "") -> Response:
 @app.get("/live/{pid}/{path:path}", include_in_schema=False)
 def live_site(pid: str, path: str = "") -> Response:
     return _serve_site("production", pid, path)
-
-
-@app.post("/staging/{pid}/{path:path}", include_in_schema=False)
-async def staging_form(pid: str, path: str, request: Request) -> Response:
-    return await _site_form("staging", pid, path, request)
-
-
-@app.post("/live/{pid}/{path:path}", include_in_schema=False)
-async def live_form(pid: str, path: str, request: Request) -> Response:
-    return await _site_form("production", pid, path, request)
 
 
 @app.get("/staging/{pid}", include_in_schema=False)

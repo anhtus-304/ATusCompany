@@ -1,7 +1,7 @@
 """Backend for the landing page. Standard library only.
 
 Serves the static site from the project root and the API endpoints below.
-Run:  python api/server.py --port 8080
+Run:  python api/server.py --port 8080 [--data /path/to/data]
 """
 from __future__ import annotations
 
@@ -102,7 +102,7 @@ class Handler(SimpleHTTPRequestHandler):
         if errors:
             self._json(400, {"error": "validation", "details": errors})
             return
-        DATA.mkdir(exist_ok=True)
+        DATA.mkdir(parents=True, exist_ok=True)
         record = {"at": time.strftime("%Y-%m-%dT%H:%M:%S"), **clean}
         with _lock, open(DATA / endpoint["store"], "a", encoding="utf-8") as fh:
             fh.write(json.dumps(record, ensure_ascii=False) + "\n")
@@ -122,7 +122,10 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=8080)
     ap.add_argument("--host", default="127.0.0.1")
+    ap.add_argument("--data", type=Path, default=None, help="thư mục lưu dữ liệu (mặc định api/data)")
     args = ap.parse_args()
+    if args.data:
+        DATA = args.data
     srv = make_server(args.port, args.host)
     print(f"Serving on http://{args.host}:{srv.server_port}")
     srv.serve_forever()

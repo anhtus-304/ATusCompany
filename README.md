@@ -2,8 +2,9 @@
 
 Phòng công nghệ ảo chạy bằng AI. Sếp nhắn yêu cầu của khách, các agent tự tiếp nhận, viết spec, code, kiểm thử và gửi báo cáo kèm bản demo để sếp duyệt.
 
-**Trạng thái: Giai đoạn 5** — giao hàng có kiểm soát: staging, deploy production, gửi email cho khách, đẩy code lên
-GitHub của khách, và duyệt chi thêm khi chạm trần ngân sách. Luồng làm việc:
+**Trạng thái: Giai đoạn 6** — ngoài landing page, đội làm được web bán hàng có giỏ hàng và đặt hàng. Giao hàng có
+kiểm soát: staging, deploy production, email cho khách, đẩy code lên GitHub của khách, duyệt chi thêm ngân sách.
+Luồng làm việc:
 
 ```
 Sếp nhắn → Lễ tân (brief) → BA/Architect (spec) → Đề xuất 3 phương án
@@ -70,6 +71,23 @@ và không xem được qua trang demo.
 - *Ngân sách*: dùng 80% trần thì nhật ký cảnh báo. Chạm trần thì dự án dừng ở trạng thái "Chạm trần ngân sách";
   sếp nhập số USD cấp thêm để làm tiếp từ bước đang dừng (bước đã xong không chạy lại) hoặc dừng hẳn dự án.
 - Các quyết định này (chi thêm, dừng, deploy, gửi, giao code) được ghi vào bộ nhớ khách hàng.
+
+**Web bán hàng (giai đoạn 6).** Lễ tân nhận ra yêu cầu bán hàng (giỏ hàng, đặt hàng, thanh toán...) và đánh dấu
+dự án là `shop`. BA viết danh mục sản phẩm (tạm, nếu khách chưa gửi). Kiến trúc sư đưa 3 phương án: Shop cơ bản
+(giỏ hàng, COD, trang quản lý đơn), Shop chuẩn (thêm chuyển khoản theo mã đơn, tra cứu đơn, tồn kho, SEO), Shop
+cao cấp (thêm hỏi đáp, giao diện tối, hiệu ứng). Sản phẩm gồm `index.html` (danh mục), `checkout.html`,
+`order.html`, `admin.html`, `cart.js` dùng chung và backend Python `api/server.py` + `api/products.json`.
+- Tổng tiền luôn tính lại ở server theo danh mục; giá sửa trong trình duyệt không có tác dụng.
+- Tra cứu đơn cần đúng cả mã đơn và số điện thoại, không trả địa chỉ. Trang quản lý cần mã truy cập
+  (`SHOP_ADMIN_TOKEN`), mỗi dự án một mã riêng nằm trên máy chủ, không nằm trong repo; sếp xem mã ở mục Giao hàng.
+- QA thử như một người mua cố tình phá: gửi giá giả, sản phẩm không tồn tại, số lượng 0 hoặc âm, đặt quá tồn
+  kho, tra cứu sai số điện thoại, vào trang quản lý không có mã. Reviewer dò thêm `innerHTML`, `eval`,
+  `document.write` và lưu mã truy cập trong `localStorage` ở file `.js`.
+- Trên staging/production, các lời gọi `api/...` chạy bằng chính backend của commit đã deploy (tiến trình riêng,
+  cổng nội bộ, không thấy biến môi trường bí mật), dữ liệu lưu ngoài thư mục được phục vụ. Staging và production
+  có đơn riêng. Sếp xem đơn production ngay trong mục Giao hàng.
+- Chưa có cổng thanh toán online (VNPay, MoMo): cần tài khoản doanh nghiệp của khách, được ghi rõ trong mỗi
+  phương án và trong báo cáo.
 
 **Dashboard văn phòng pixel** (`dashboard/`, làm riêng) đọc luồng sự kiện realtime ở `ws://<host>/ws/events`
 theo hợp đồng trong `dashboard/src/types.ts`: `snapshot`, `agent`, `task`, `log`; gửi `{type: "assign", to, text}`
@@ -142,4 +160,5 @@ Test: `python -m pytest -q`
 - [x] Giai đoạn 3: tách frontend/backend, thêm QA chạy test thật, Reviewer bảo mật, UI/UX Designer, WebSocket cho dashboard
 - [x] Giai đoạn 4: bộ nhớ khách hàng và quyết định đã chốt, bảng điểm từng agent, gói giao khách
 - [x] Giai đoạn 5: staging, deploy production, email bàn giao, đẩy code lên GitHub của khách, duyệt chi thêm ngân sách
-- [ ] Tiếp theo: chạy thử với model thật và chỉnh prompt, hosting ngoài (GitHub Pages, VPS), web nhiều trang có giỏ hàng và thanh toán
+- [x] Giai đoạn 6: web bán hàng: danh mục, giỏ hàng, đặt hàng COD/chuyển khoản, tra cứu đơn, quản lý đơn, tồn kho
+- [ ] Tiếp theo: chạy thử với model thật và chỉnh prompt, cổng thanh toán online (cần tài khoản của khách), hosting ngoài (VPS)

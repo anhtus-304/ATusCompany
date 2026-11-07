@@ -12,9 +12,10 @@ import unicodedata
 from html.parser import HTMLParser
 from pathlib import Path
 
+from . import shop
 from .artifacts import (
     FEATURES, Brief, Check, ClientMemory, ClientMessage, CodeArtifact, DesignSpec, FileOut, FinalReport, Option, Proposal, QAReport,
-    Section, Spec,
+    Section, Spec, allowed_features,
 )
 from .llm import LLM
 from .workspace import RoleView
@@ -67,9 +68,16 @@ def intake(llm: LLM, message: str, memory: ClientMemory | None = None) -> Brief:
     name = extract_client_name(message) or (memory.client_name if memory and memory.is_returning else business)
     budget = re.search(r"(\d[\d.,]*\s*(?:triệu|tr|k|đ|vnd|usd|\$))", lower)
     deadline = re.search(r"(\d+\s*(?:ngày|tuần|tháng|days?|weeks?))", lower)
+    kind = "shop" if shop.is_shop(message) else "landing"
     assumptions = [f"Đối tượng: {audience}", "Giọng điệu thân thiện, đáng tin cậy",
-                   "Sản phẩm là landing page một trang"]
+                   "Sản phẩm là web bán hàng: danh mục, giỏ hàng, đặt hàng, quản lý đơn" if kind == "shop"
+                   else "Sản phẩm là landing page một trang"]
     questions = []
+    if kind == "shop":
+        assumptions.append("Danh mục và giá dưới đây là tạm, chờ khách gửi danh sách thật")
+        questions += ["Khách gửi danh sách sản phẩm, giá và số lượng tồn kho thật?",
+                      "Khách nhận thanh toán thế nào: COD, chuyển khoản, hay cần cổng thanh toán online?",
+                      "Phí giao hàng và khu vực giao?"]
     budget_text = budget.group(1) if budget else None
     if memory and memory.is_returning:
         last = memory.projects[-1]
@@ -90,7 +98,7 @@ def intake(llm: LLM, message: str, memory: ClientMemory | None = None) -> Brief:
     if not (memory and memory.is_returning):
         questions.append("Khách có logo, ảnh thật, địa chỉ và số điện thoại để thay chỗ giữ chỗ không?")
     return Brief(
-        project_name=name, business_type=business, goal=message.strip(),
+        kind=kind, project_name=name, business_type=business, goal=message.strip(),
         target_audience=audience, tone="Thân thiện, đáng tin cậy",
         language=_guess_language(message),
         budget=budget_text or "chưa rõ",
@@ -105,7 +113,14 @@ def analyst(llm: LLM, brief: Brief) -> Spec:
     out = llm.structured("analyst", prompt("analyst"),
                          f"Brief:\n{brief.model_dump_json(indent=2)}", Spec)
     if out is not None:
-        return _normalize_spec(out)
+        return _shopify(_normalize_spec(out), brief)
+    if brief.kind == "shop":
+        return _shopify(Spec(
+            project_name=brief.project_name, page_title=f"{brief.project_name} | Mua online", goal=brief.goal,
+            audience=brief.target_audience, language=brief.language, sections=shop.sections(brief),
+            cta_text="Mua ngay", palette=["#3b2a20", "#c8956d", "#f6efe7", "#1f1f1f"],
+            tech="HTML + CSS + JavaScript thuần, backend Python thư viện chuẩn",
+            acceptance_criteria=default_criteria()), brief)
 
     n = brief.project_name
     sections = [
@@ -129,6 +144,19 @@ def analyst(llm: LLM, brief: Brief) -> Spec:
         tech="HTML5 + CSS tĩnh, không phụ thuộc bên ngoài",
         acceptance_criteria=default_criteria(),
     )
+
+
+def _shopify(spec: Spec, brief: Brief) -> Spec:
+    """Shop specs always carry a catalog and a product list section."""
+    spec.kind = brief.kind
+    if spec.kind != "shop":
+        spec.products = []
+        return spec
+    spec.products = shop.normalize_products(spec.products) or shop.sample_catalog(brief.business_type, brief.goal)
+    if not any(s.id == "products" for s in spec.sections):
+        spec.sections.insert(1, Section(id="products", heading="Sản phẩm", purpose="Danh mục",
+                                        content=[p.name for p in spec.products[:6]]))
+    return spec
 
 
 def default_criteria() -> list[str]:
@@ -176,15 +204,16 @@ def _budget_vnd(text: str) -> int | None:
 def proposer(llm: LLM, brief: Brief, spec: Spec, note: str = "",
              previous: Proposal | None = None, memory: ClientMemory | None = None) -> Proposal:
     user = (f"Bộ nhớ khách hàng:\n{memory.as_prompt()}\n\n" if memory else "") + (f"Brief:\n{brief.model_dump_json(indent=2)}\n\nSpec gốc:\n{spec.model_dump_json(indent=2)}"
-            f"\n\nTính năng cho phép:\n" + "\n".join(f"- {k}: {v}" for k, v in FEATURES.items()))
+            f"\n\nLoại dự án: {spec.kind}\nTính năng cho phép:\n"
+            + "\n".join(f"- {k}: {FEATURES[k]}" for k in allowed_features(spec.kind)))
     if note:
         user += f"\n\nGóp ý của Sếp về các phương án lần trước:\n{note}"
         if previous:
             user += f"\n\nPhương án lần trước:\n{previous.model_dump_json(indent=2)}"
-    out = llm.structured("proposer", prompt("proposer"), user, Proposal)
+    out = llm.structured("proposer", prompt("proposer_shop" if spec.kind == "shop" else "proposer"), user, Proposal)
     if out is None:
         out = _mock_proposal(brief, spec, note, memory)
-    return _normalize_proposal(out)
+    return _normalize_proposal(out, spec.kind)
 
 
 def _mock_proposal(brief: Brief, spec: Spec, note: str, memory: ClientMemory | None = None) -> Proposal:
@@ -201,7 +230,7 @@ def _mock_proposal(brief: Brief, spec: Spec, note: str, memory: ClientMemory | N
         return [f"Vượt ngân sách khách nêu ({brief.budget})"] if budget and price > budget else []
 
     a_price, b_price, c_price = 2_500_000, 5_000_000, 12_000_000
-    options = [
+    options = shop.options(spec, over) if spec.kind == "shop" else [
         Option(id="A", tier="fast", name="Nhanh & rẻ",
                summary="Trang ngắn 3 mục, đủ để khách biết và liên hệ.",
                sections=[hero, *middle[:1], contact], features=["responsive"],
@@ -216,7 +245,7 @@ def _mock_proposal(brief: Brief, spec: Spec, note: str, memory: ClientMemory | N
                cons=["Cần khách cung cấp nội dung thật cho nhiều mục"] + over(b_price)),
         Option(id="C", tier="premium", name="Cao cấp",
                summary="Thêm thư viện ảnh, hỏi đáp, form liên hệ, giao diện tối và hiệu ứng.",
-               sections=[hero, *middle, gallery, faq, contact], features=list(FEATURES),
+               sections=[hero, *middle, gallery, faq, contact], features=allowed_features("landing"),
                est_days=10, est_price_vnd=c_price,
                pros=["Trải nghiệm chuyên nghiệp, nổi bật", "Form liên hệ giảm bước cho khách"],
                cons=["Lâu và tốn kém hơn", "Cần ảnh chất lượng cao từ khách"] + over(c_price)),
@@ -239,9 +268,12 @@ def _mock_proposal(brief: Brief, spec: Spec, note: str, memory: ClientMemory | N
     return Proposal(options=options, recommended=rec, reasoning=reasoning)
 
 
-def _normalize_proposal(p: Proposal) -> Proposal:
+def _normalize_proposal(p: Proposal, kind: str = "landing") -> Proposal:
+    allowed = allowed_features(kind)
     for o in p.options:
-        o.features = [f for f in o.features if f in FEATURES]
+        o.features = [f for f in dict.fromkeys(o.features) if f in allowed]
+        if kind == "shop":
+            shop.normalize_option(o)
         tmp = Spec(project_name="", page_title="", goal="", audience="", language="", sections=o.sections,
                    cta_text="", palette=[], tech="", acceptance_criteria=[])
         o.sections = _normalize_spec(tmp).sections
@@ -259,11 +291,15 @@ def apply_option(spec: Spec, option: Option) -> Spec:
     final.features = list(option.features)
     if not final.meta_description:
         final.meta_description = spec.goal[:155]
-    if "contact_form" in final.features and not any(ep.path == "/api/contact" for ep in final.api):
+    if final.kind == "shop":
+        final.api = shop.endpoints(final.features)
+    elif "contact_form" in final.features and not any(ep.path == "/api/contact" for ep in final.api):
         from .team import contact_endpoint
         final.api.append(contact_endpoint())
     final.acceptance_criteria = default_criteria() + [
         f"Tính năng: {FEATURES[f]}" for f in option.features]
+    if final.kind == "shop":
+        final.acceptance_criteria += shop.criteria(final.features)
     if final.api:
         final.acceptance_criteria += [
             "Backend có test tự động và tất cả đều đạt",
@@ -285,7 +321,8 @@ def frontend_dev(llm: LLM, spec: Spec, ws: RoleView, qa_failures: list[Check] | 
         if previous:
             user += "\n\nCode lần trước:\n" + "\n\n".join(
                 f"=== {f.path} ===\n{f.content}" for f in previous.files)
-    out = llm.structured("frontend_dev", prompt("frontend_dev"), user, CodeArtifact)
+    out = llm.structured("frontend_dev", prompt("frontend_dev") + (
+        "\n\n" + prompt("frontend_dev_shop") if spec.kind == "shop" else ""), user, CodeArtifact)
     if out is None:
         out = _render_template(spec, design)
     for f in out.files:
@@ -306,6 +343,7 @@ def _render_template(spec: Spec, design: DesignSpec | None = None) -> CodeArtifa
     width = design.max_width_px if design else 1040
     layout = {d.id: d.layout for d in design.sections} if design else {}
     api = {ep.path: ep for ep in spec.api}
+    is_shop = spec.kind == "shop"
 
     def form_html() -> str:
         ep = api.get("/api/contact")
@@ -335,7 +373,9 @@ def _render_template(spec: Spec, design: DesignSpec | None = None) -> CodeArtifa
             blocks.append(
                 f'<section id="{sec.id}" class="hero">\n  <div class="wrap">\n'
                 f"    <h1>{e(sec.heading)}</h1>\n    <p class=\"lead\">{e(sec.content[0] if sec.content else sec.purpose)}</p>\n"
-                f'    <a class="cta" href="#contact">{e(spec.cta_text)}</a>\n  </div>\n</section>')
+                f'    <a class="cta" href="#{"products" if is_shop else "contact"}">{e(spec.cta_text)}</a>\n  </div>\n</section>')
+        elif is_shop and sec.id == "products":
+            blocks.append(shop.products_section(spec, sec, f' class="{cls.strip()}"'))
         elif sec.id == "faq" and "faq_accordion" in f:
             qs = "".join(f"<details><summary>{e(x)}</summary><p>[Câu trả lời]</p></details>" for x in sec.content)
             blocks.append(f'<section id="{sec.id}" class="{cls.strip()}">\n  <div class="wrap">\n    <h2>{e(sec.heading)}</h2>\n'
@@ -352,6 +392,8 @@ def _render_template(spec: Spec, design: DesignSpec | None = None) -> CodeArtifa
                 f'    <ul class="{ul}">{items}</ul>\n  </div>\n</section>')
     blocks = [b.replace(' class=""', "") for b in blocks]
     nav = "".join(f'<a href="#{s.id}">{e(s.heading)}</a>' for s in spec.sections[1:])
+    if is_shop:
+        nav += shop.header_extra()
     seo = ""
     if "seo_meta" in f:
         desc = e(spec.meta_description or spec.goal[:155])
@@ -364,7 +406,7 @@ def _render_template(spec: Spec, design: DesignSpec | None = None) -> CodeArtifa
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">{seo}
 <title>{e(spec.page_title)}</title>
-<link rel="stylesheet" href="styles.css">
+<link rel="stylesheet" href="styles.css">{chr(10) + '<script src="cart.js" defer></script>' if is_shop else ''}
 </head>
 <body>
 <header class="top"><div class="wrap"><strong>{e(spec.project_name)}</strong><nav>{nav}</nav></div></header>
@@ -418,8 +460,11 @@ footer {{ background: var(--ink); color: var(--surface); padding: 24px 0; font-s
         css += ("@keyframes rise { from { opacity: 0; transform: translateY(16px); } to { opacity: 1; transform: none; } }\n"
                 ".reveal { animation: rise .7s ease-out both; }\n"
                 "@media (prefers-reduced-motion: reduce) { .reveal { animation: none; } }\n")
-    return CodeArtifact(files=[FileOut(path="index.html", content=page),
-                               FileOut(path="styles.css", content=css)],
+    files = [FileOut(path="index.html", content=page)]
+    if is_shop:
+        css += shop.CSS
+        files += shop.pages(spec)
+    return CodeArtifact(files=files + [FileOut(path="styles.css", content=css)],
                         notes="Sinh từ template offline (chế độ mock).")
 
 # --------------------------------------------------------------------------- QA
@@ -546,6 +591,9 @@ def qa(spec: Spec, ws: RoleView) -> QAReport:
 
     for name, ok, detail in _feature_checks(spec, ws, src, tags):
         add(name, ok, detail)
+    if spec.kind == "shop":
+        for name, ok, detail in shop.qa_checks(spec, ws, _Collector):
+            add(name, ok, detail)
 
     for ep in spec.api:
         if ep.method != "POST" or ep.path != "/api/contact" or "contact_form" not in spec.features:
@@ -594,12 +642,16 @@ def reporter(llm: LLM, brief: Brief, spec: Spec, qa_report: QAReport, fix_rounds
             risks.insert(0, "Reviewer còn lỗi chưa sửa: " + "; ".join(f"{f.file}: {f.message}" for f in blocking))
         if minors:
             remaining.append("Gợi ý từ Reviewer: " + "; ".join(f"{f.file}: {f.message}" for f in minors))
-    if spec.api:
+    if spec.kind == "shop":
+        remaining.insert(0, "Thay danh mục, giá, tồn kho tạm bằng dữ liệu thật của khách; điền thông tin chuyển khoản")
+        risks += [shop.GATEWAY_RISK,
+                  "Đơn hàng chứa tên, số điện thoại, địa chỉ khách: cần sao lưu và giữ kín mã truy cập trang quản lý"]
+    elif spec.api:
         risks.append("Backend lưu dữ liệu khách vào file trên máy chủ, cần chọn hosting có backup trước khi chạy thật")
     if escalated:
         risks.insert(0, "Đã hết số lần sửa lỗi tự động, cần người xử lý")
     return FinalReport(
-        summary=(f"Đã làm xong landing page tĩnh cho {spec.project_name} theo phương án "
+        summary=(f"Đã làm xong {'web bán hàng (' + str(len(spec.products)) + ' sản phẩm, giỏ hàng, đặt hàng)' if spec.kind == 'shop' else 'landing page tĩnh'} cho {spec.project_name} theo phương án "
                  f"{option.id + ' (' + option.name + ')' if option else 'mặc định'}, {len(spec.sections)} mục. "
                  f"QA chạy {total} kiểm tra, {status} sau {fix_rounds} vòng sửa."
                  + (f" Đây là dự án thứ {len(memory.projects) + 1} của khách {memory.client_name}."
@@ -609,7 +661,8 @@ def reporter(llm: LLM, brief: Brief, spec: Spec, qa_report: QAReport, fix_rounds
                 if option else []),
               "UI/UX Designer lập design spec (màu, font, bố cục từng mục)",
               *(["Backend Dev viết API " + ", ".join(ep.path for ep in spec.api) + " kèm test"] if spec.api else []),
-              "Frontend Dev code index.html + styles.css, commit vào repo dự án",
+              ("Frontend Dev code trang sản phẩm, giỏ hàng, đặt hàng, tra cứu/quản lý đơn (cart.js), commit vào repo dự án"
+               if spec.kind == "shop" else "Frontend Dev code index.html + styles.css, commit vào repo dự án"),
               f"QA {passed}/{total} kiểm tra đạt",
               *([f"Reviewer: {len(review.blocking())} lỗi chặn, {len(review.findings)} ghi chú"] if review else [])],
         remaining=remaining,
@@ -649,9 +702,14 @@ def client_message(llm: LLM, brief: Brief, spec: Spec, option: Option | None, re
     link = links.get("Bản chạy thật") or links.get("Bản demo") or ""
     todo = ["Gửi ảnh thật và logo để thay ảnh minh họa",
             "Xem lại các nội dung trong ngoặc vuông [..] và gửi thông tin chính xác (địa chỉ, số điện thoại, giờ mở cửa)"]
-    todo += [q for q in brief.open_questions if not re.search(r"logo|ảnh|địa chỉ|điện thoại", q, re.I)][:3]
+    if spec.kind == "shop":
+        todo.insert(0, "Gửi danh sách sản phẩm, giá, tồn kho thật và thông tin tài khoản nhận chuyển khoản")
+    # Open questions are written for the boss ("Khách ..."); only pass on the ones that read well to the client.
+    todo += [q for q in brief.open_questions
+             if not re.search(r"logo|ảnh|địa chỉ|điện thoại|^khách|sản phẩm|thanh toán", q, re.I)][:3]
+    what = "website bán hàng" if spec.kind == "shop" else "landing page"
     lines = [f"Chào anh/chị {client_name},", "",
-             f"Bên em đã hoàn thành bản demo landing page {spec.project_name}"
+             f"Bên em đã hoàn thành bản demo {what} {spec.project_name}"
              + (f" theo phương án {option.name}" if option else "") + ".",
              "Trang gồm các mục: " + ", ".join(s.heading for s in spec.sections) + "."]
     if option and option.features:
@@ -660,5 +718,8 @@ def client_message(llm: LLM, brief: Brief, spec: Spec, option: Option | None, re
         lines += ["", f"Anh/chị xem trang tại: {link}"]
     lines += ["", "Để hoàn thiện, anh/chị giúp bên em:", *[f"- {t}" for t in todo], "",
               "Anh/chị xem và phản hồi giúp em, bên em sẽ chỉnh theo góp ý.", "", "Trân trọng."]
-    return ClientMessage(subject=f"Bàn giao bản demo landing page {spec.project_name}", body="\n".join(lines))
+    if spec.kind == "shop" and "admin_orders" in spec.features and link:
+        i = lines.index(f"Anh/chị xem trang tại: {link}")
+        lines.insert(i + 1, f"Trang quản lý đơn hàng: {link}admin.html (mã truy cập bên em gửi riêng qua điện thoại)")
+    return ClientMessage(subject=f"Bàn giao bản demo {what} {spec.project_name}", body="\n".join(lines))
 

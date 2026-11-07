@@ -10,7 +10,7 @@ import subprocess
 from pathlib import Path
 
 def _frontend_path(rel: str) -> bool:
-    return not rel.startswith(("api/", "design/", ".")) and rel.endswith((".html", ".css", ".svg", ".png", ".jpg", ".webp", ".ico"))
+    return not rel.startswith(("api/", "design/", ".")) and rel.endswith((".html", ".css", ".js", ".svg", ".png", ".jpg", ".webp", ".ico"))
 
 
 # Least privilege: each role may only write its own part of the project.

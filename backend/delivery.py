@@ -11,21 +11,25 @@ contract and stored outside the published folder.
 """
 from __future__ import annotations
 
+import atexit
 import base64
+import http.client
 import io
 import json
 import os
 import re
 import shutil
+import secrets
 import smtplib
+import socket
 import subprocess
+import sys
 import tarfile
 import threading
 import time
 import uuid
 from email.message import EmailMessage
 from pathlib import Path, PurePosixPath
-from urllib.parse import parse_qs
 
 ROOT = Path(__file__).resolve().parent.parent
 ENVS = ("staging", "production")
@@ -35,10 +39,6 @@ MAX_BODY = 16 * 1024
 EMAIL_RE = re.compile(r"^[^@\s<>,;]+@[^@\s<>,;]+\.[^@\s<>,;]+$")
 REPO_RE = re.compile(r"^[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}$")
 BRANCH_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,99}$")
-PATTERNS = {
-    "email": re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$"),
-    "phone": re.compile(r"^\+?[0-9 .()-]{8,20}$"),
-}
 _lock = threading.Lock()
 
 
@@ -74,8 +74,9 @@ def _public(rel: PurePosixPath) -> bool:
     return bool(parts) and parts[0] not in PRIVATE_TOP and not any(p.startswith(".") or p == "__pycache__" for p in parts)
 
 
-def snapshot(src: Path, sha: str, dest: Path) -> list[str]:
-    """Write the public files of commit `sha` into `dest`."""
+def snapshot(src: Path, sha: str, dest: Path, select=None) -> list[str]:
+    """Write the files of commit `sha` chosen by `select` (default: the public site) into `dest`."""
+    select = select or _public
     if not re.fullmatch(r"[0-9a-f]{7,40}", sha):
         raise DeliveryError("Mã commit không hợp lệ")
     out = _git(src, "archive", "--format=tar", sha)
@@ -85,13 +86,13 @@ def snapshot(src: Path, sha: str, dest: Path) -> list[str]:
     with tarfile.open(fileobj=io.BytesIO(out.stdout)) as tar:
         for m in tar.getmembers():
             rel = PurePosixPath(m.name)
-            if not m.isfile() or rel.is_absolute() or ".." in rel.parts or not _public(rel):
+            if not m.isfile() or rel.is_absolute() or ".." in rel.parts or not select(rel):
                 continue
             target = dest / Path(*rel.parts)
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_bytes(tar.extractfile(m).read())
             files.append(str(rel))
-    if "index.html" not in files:
+    if select is _public and "index.html" not in files:
         raise DeliveryError("Commit không có index.html")
     return sorted(files)
 
@@ -103,20 +104,30 @@ def deploy(pid: str, src: Path, env: str, sha: str | None = None) -> dict:
     sha = sha or head_sha(src)
     base = deploy_root() / pid
     base.mkdir(parents=True, exist_ok=True)
-    tmp = base / f".tmp-{env}-{uuid.uuid4().hex[:8]}"
-    old = base / f".old-{env}-{uuid.uuid4().hex[:8]}"
+    files = _swap(base, env, lambda d: snapshot(src, sha, d))
+    # The backend (api/ only, never its data) goes next to it, outside the published folder.
+    backend = _swap(base, f"{env}-app", lambda d: snapshot(src, sha, d, _backend_file))
+    stop_backend(pid, env)  # next request starts the new code
+    return {"env": env, "sha": sha, "files": len(files), "backend": bool(backend),
+            "url": public_url() + site_path(pid, env), "at": time.strftime("%Y-%m-%d %H:%M:%S")}
+
+
+def _swap(base: Path, name: str, build) -> list[str]:
+    """Build a folder next to `base/name` and replace it in one rename, so it is never half-written."""
+    tmp = base / f".tmp-{name}-{uuid.uuid4().hex[:8]}"
+    old = base / f".old-{name}-{uuid.uuid4().hex[:8]}"
     try:
-        files = snapshot(src, sha, tmp)
+        tmp.mkdir()
+        files = build(tmp)
         with _lock:
-            target = base / env
+            target = base / name
             if target.exists():
                 target.rename(old)
             tmp.rename(target)
+        return files
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
         shutil.rmtree(old, ignore_errors=True)
-    return {"env": env, "sha": sha, "files": len(files), "url": public_url() + site_path(pid, env),
-            "at": time.strftime("%Y-%m-%d %H:%M:%S")}
 
 
 def site_file(pid: str, env: str, path: str) -> Path | None:
@@ -129,57 +140,115 @@ def site_file(pid: str, env: str, path: str) -> Path | None:
     return target
 
 
-# ---------------------------------------------------------------- form posts on deployed sites
+# ---------------------------------------------------------------- the project's own backend, behind a proxy
 
-def validate(fields: list[dict], data: dict) -> tuple[dict, list[str]]:
-    """Same rules as the generated api/server.py."""
-    clean, errors = {}, []
-    for f in fields:
-        value = str(data.get(f["name"], "")).strip()
-        if not value:
-            if f["required"]:
-                errors.append(f"{f['name']}: bắt buộc")
-            continue
-        if len(value) > f["max_length"]:
-            errors.append(f"{f['name']}: tối đa {f['max_length']} ký tự")
-            continue
-        pattern = PATTERNS.get(f["type"])
-        if pattern and not pattern.match(value):
-            errors.append(f"{f['name']}: không hợp lệ")
-            continue
-        clean[f["name"]] = value
-    return clean, errors
+_procs: dict[tuple[str, str], tuple[subprocess.Popen, int]] = {}
+_proc_lock = threading.Lock()
 
 
-def submit(pid: str, env: str, endpoint: dict, raw: bytes, content_type: str) -> tuple[int, dict]:
-    """Store one form post. Returns (status, payload); payload has "redirect" for HTML form posts."""
-    if len(raw) > MAX_BODY:
-        return 413, {"error": "payload too large"}
-    text = raw.decode("utf-8", errors="replace")
-    is_json = "application/json" in (content_type or "")
+def _backend_file(rel: PurePosixPath) -> bool:
+    parts = rel.parts
+    return (len(parts) > 1 and parts[0] == "api" and parts[1] != "data"
+            and not any(p.startswith(".") or p == "__pycache__" for p in parts))
+
+
+def app_dir(pid: str, env: str) -> Path:
+    return deploy_root() / pid / f"{env}-app"
+
+
+def admin_token(pid: str) -> str:
+    """Per-project access code for the shop's order admin. Lives on the server only, never in the repo."""
+    f = deploy_root() / pid / "admin_token"
+    if not f.exists():
+        f.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(f, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w") as fh:
+            fh.write(secrets.token_urlsafe(24))
+    return f.read_text().strip()
+
+
+def _free_port() -> int:
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+def stop_backend(pid: str, env: str) -> None:
+    with _proc_lock:
+        entry = _procs.pop((pid, env), None)
+    if entry:
+        proc = entry[0]
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+
+
+def stop_all() -> None:
+    for pid, env in list(_procs):
+        stop_backend(pid, env)
+
+
+atexit.register(stop_all)
+
+
+def ensure_backend(pid: str, env: str) -> int | None:
+    """Start the deployed commit's api/server.py on a private port (once), with its data outside the code."""
+    with _proc_lock:
+        entry = _procs.get((pid, env))
+        if entry and entry[0].poll() is None:
+            return entry[1]
+        app = app_dir(pid, env)
+        if not (app / "api" / "server.py").is_file():
+            return None
+        data = deploy_root() / pid / "data" / env
+        data.mkdir(parents=True, exist_ok=True)
+        port = _free_port()
+        from ai.team import _sandbox_env  # same rules as QA: generated code never sees our secrets
+        proc = subprocess.Popen([sys.executable, "api/server.py", "--port", str(port), "--data", str(data)],
+                                cwd=app, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                env=_sandbox_env() | {"SHOP_ADMIN_TOKEN": admin_token(pid)})
+        for _ in range(100):
+            try:
+                socket.create_connection(("127.0.0.1", port), timeout=0.2).close()
+                _procs[(pid, env)] = (proc, port)
+                return port
+            except OSError:
+                if proc.poll() is not None:
+                    break
+                time.sleep(0.05)
+        proc.kill()
+        raise DeliveryError("Backend của dự án không khởi động được")
+
+
+PASS_HEADERS = ("content-type", "location", "cache-control")
+
+
+def proxy(pid: str, env: str, method: str, path: str, query: str, body: bytes,
+          headers: dict[str, str]) -> tuple[int, dict[str, str], bytes]:
+    """Forward /<site>/<pid>/api/... to the project's own backend."""
+    if len(body) > MAX_BODY:
+        return 413, {"content-type": "application/json"}, b'{"error": "payload too large"}'
     try:
-        data = json.loads(text or "{}") if is_json else {k: v[0] for k, v in parse_qs(text).items()}
-    except json.JSONDecodeError:
-        return 400, {"error": "invalid json"}
-    if not isinstance(data, dict):
-        return 400, {"error": "invalid body"}
-    clean, errors = validate([f for f in endpoint.get("fields", [])], data)
-    if errors:
-        return 400, {"error": "validation", "details": errors}
-    store = endpoint["path"].strip("/").replace("/", "_") + ".jsonl"
-    folder = deploy_root() / pid / "data" / env  # outside the published site
-    folder.mkdir(parents=True, exist_ok=True)
-    record = {"at": time.strftime("%Y-%m-%dT%H:%M:%S"), **clean}
-    with _lock, open(folder / store, "a", encoding="utf-8") as fh:
-        fh.write(json.dumps(record, ensure_ascii=False) + "\n")
-    if is_json:
-        return endpoint.get("success_status", 201), {"ok": True}
-    return 303, {"redirect": "../?sent=1#sent"}
-
-
-def submissions(pid: str, env: str) -> int:
-    folder = deploy_root() / pid / "data" / env
-    return sum(sum(1 for _ in open(f, encoding="utf-8")) for f in folder.glob("*.jsonl")) if folder.is_dir() else 0
+        port = ensure_backend(pid, env)
+    except DeliveryError:
+        port = 0
+    if port is None:
+        return 404, {"content-type": "application/json"}, b'{"error": "not found"}'
+    if not port:
+        return 502, {"content-type": "application/json"}, b'{"error": "backend unavailable"}'
+    fwd = {k: v for k, v in headers.items() if k.lower() in ("content-type", "authorization")}
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=15)
+    try:
+        conn.request(method, "/api/" + path + (f"?{query}" if query else ""), body=body or None, headers=fwd)
+        r = conn.getresponse()
+        return r.status, {k.lower(): v for k, v in r.getheaders() if k.lower() in PASS_HEADERS}, r.read()
+    except (OSError, http.client.HTTPException):
+        stop_backend(pid, env)
+        return 502, {"content-type": "application/json"}, b'{"error": "backend unavailable"}'
+    finally:
+        conn.close()
 
 
 # ---------------------------------------------------------------- push to the client's GitHub

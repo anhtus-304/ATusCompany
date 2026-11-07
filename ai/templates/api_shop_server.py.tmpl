@@ -1,0 +1,275 @@
+"""Backend for the shop. Standard library only.
+
+Serves the static site from the project root and the shop API:
+  GET  /api/products               catalog (prices and stock come from api/products.json)
+  POST /api/orders                 place an order; the total is computed here, never trusted from the client
+  POST /api/orders/lookup          order status by code + phone
+  GET  /api/admin/orders           all orders (Authorization: Bearer $SHOP_ADMIN_TOKEN)
+  POST /api/admin/orders/status    change an order's status (same token)
+
+Run:  SHOP_ADMIN_TOKEN=... python api/server.py --port 8080 --data /path/to/data
+"""
+from __future__ import annotations
+
+import argparse
+import hmac
+import json
+import os
+import re
+import secrets
+import threading
+import time
+from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+HERE = Path(__file__).resolve().parent
+DATA = HERE / "data"
+MAX_BODY = 16 * 1024
+MAX_LINES = 30
+MAX_QTY = 99
+_lock = threading.Lock()
+
+# Chosen by the Architect from the boss's option.
+FEATURES = __FEATURES__
+
+STATUSES = ["new", "confirmed", "paid", "shipping", "done", "cancelled"]
+FIELDS = {"name": 100, "phone": 20, "address": 300, "note": 500}
+OPTIONAL = {"note"}
+PHONE = re.compile(r"^\+?[0-9 .()-]{8,20}$")
+CODE = re.compile(r"^DH[A-Z0-9]{6}$")
+
+
+def products() -> list[dict]:
+    return json.loads((HERE / "products.json").read_text(encoding="utf-8"))
+
+
+def _orders_file() -> Path:
+    return DATA / "orders.json"
+
+
+def load_orders() -> list[dict]:
+    f = _orders_file()
+    return json.loads(f.read_text(encoding="utf-8")) if f.exists() else []
+
+
+def save_orders(orders: list[dict]) -> None:
+    DATA.mkdir(parents=True, exist_ok=True)
+    tmp = _orders_file().with_suffix(".tmp")
+    tmp.write_text(json.dumps(orders, ensure_ascii=False, indent=1), encoding="utf-8")
+    tmp.replace(_orders_file())
+
+
+def stock_left(orders: list[dict]) -> dict[str, int]:
+    left = {p["id"]: int(p.get("stock", 0)) for p in products()}
+    for o in orders:
+        if o["status"] != "cancelled":
+            for line in o["items"]:
+                if line["id"] in left:
+                    left[line["id"]] -= line["qty"]
+    return left
+
+
+def catalog_view() -> dict:
+    left = stock_left(load_orders()) if FEATURES["stock"] else {}
+    items = []
+    for p in products():
+        item = {"id": p["id"], "name": p["name"], "price_vnd": p["price_vnd"], "description": p.get("description", "")}
+        if FEATURES["stock"]:
+            item["in_stock"] = max(0, left.get(p["id"], 0))
+        items.append(item)
+    return {"products": items, "payments": FEATURES["payments"]}
+
+
+def _digits(phone: str) -> str:
+    return re.sub(r"\D", "", phone)
+
+
+def public_order(o: dict) -> dict:
+    return {k: o[k] for k in ("code", "at", "status", "payment", "total_vnd", "items")}
+
+
+def create_order(data: dict) -> tuple[int, dict]:
+    errors, clean = [], {}
+    for name, limit in FIELDS.items():
+        value = str(data.get(name, "")).strip()
+        if not value:
+            if name not in OPTIONAL:
+                errors.append(f"{name}: bắt buộc")
+            continue
+        if len(value) > limit:
+            errors.append(f"{name}: tối đa {limit} ký tự")
+            continue
+        clean[name] = value
+    if "phone" in clean and not PHONE.match(clean["phone"]):
+        errors.append("phone: không hợp lệ")
+    payment = data.get("payment")
+    if payment not in FEATURES["payments"]:
+        errors.append("payment: không hợp lệ")
+    catalog = {p["id"]: p for p in products()}
+    wanted: dict[str, int] = {}
+    items = data.get("items")
+    if not isinstance(items, list) or not 1 <= len(items) <= MAX_LINES:
+        errors.append(f"items: cần từ 1 đến {MAX_LINES} sản phẩm")
+    else:
+        for line in items:
+            pid = line.get("id") if isinstance(line, dict) else None
+            qty = line.get("qty") if isinstance(line, dict) else None
+            if pid not in catalog:
+                errors.append("items: có sản phẩm không tồn tại")
+                continue
+            if not isinstance(qty, int) or isinstance(qty, bool) or not 1 <= qty <= MAX_QTY:
+                errors.append(f"items: số lượng phải từ 1 đến {MAX_QTY}")
+                continue
+            wanted[pid] = wanted.get(pid, 0) + qty
+        if any(q > MAX_QTY for q in wanted.values()):
+            errors.append(f"items: số lượng phải từ 1 đến {MAX_QTY}")
+    if errors:
+        return 400, {"error": "validation", "details": errors}
+    with _lock:
+        orders = load_orders()
+        if FEATURES["stock"]:
+            left = stock_left(orders)
+            short = [catalog[i]["name"] for i, q in wanted.items() if q > left.get(i, 0)]
+            if short:
+                return 409, {"error": "out_of_stock", "message": "Không đủ hàng: " + ", ".join(short)}
+        # Prices always come from the catalog. Anything the client sent about prices is ignored.
+        lines = [{"id": i, "name": catalog[i]["name"], "price_vnd": int(catalog[i]["price_vnd"]), "qty": q}
+                 for i, q in wanted.items()]
+        taken = {o["code"] for o in orders}
+        code = "DH" + "".join(secrets.choice("ABCDEFGHJKLMNPQRSTUVWXYZ23456789") for _ in range(6))
+        while code in taken:
+            code = "DH" + "".join(secrets.choice("ABCDEFGHJKLMNPQRSTUVWXYZ23456789") for _ in range(6))
+        order = {"code": code, "at": time.strftime("%Y-%m-%dT%H:%M:%S"), "status": "new", "payment": payment,
+                 "total_vnd": sum(x["price_vnd"] * x["qty"] for x in lines), "items": lines, **clean}
+        orders.append(order)
+        save_orders(orders)
+    return 201, public_order(order)
+
+
+def lookup(data: dict) -> tuple[int, dict]:
+    code = str(data.get("code", "")).strip().upper()
+    phone = _digits(str(data.get("phone", "")))[:20]
+    if not CODE.match(code) or len(phone) < 8:
+        return 400, {"error": "validation", "details": ["code, phone: không hợp lệ"]}
+    order = next((o for o in load_orders() if o["code"] == code), None)
+    # Same answer for a wrong code and a wrong phone, so codes can't be probed.
+    if order is None or _digits(order["phone"]) != phone:
+        return 404, {"error": "not_found", "message": "Không tìm thấy đơn với mã và số điện thoại này"}
+    return 200, public_order(order)
+
+
+def set_status(data: dict) -> tuple[int, dict]:
+    code, status = str(data.get("code", "")).strip().upper(), data.get("status")
+    if status not in STATUSES:
+        return 400, {"error": "validation", "details": ["status: không hợp lệ"]}
+    with _lock:
+        orders = load_orders()
+        order = next((o for o in orders if o["code"] == code), None)
+        if order is None:
+            return 404, {"error": "not_found"}
+        order["status"] = status
+        save_orders(orders)
+    return 200, public_order(order)
+
+
+class Handler(SimpleHTTPRequestHandler):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, directory=str(ROOT), **kwargs)
+
+    def log_message(self, fmt, *args):  # never log customer data
+        pass
+
+    def _path(self) -> str:
+        return self.path.split("?")[0]
+
+    def _blocked(self) -> bool:
+        parts = self._path().strip("/").split("/")
+        return bool(parts) and parts[0] in ("api", ".git", ".vtd", "design")
+
+    def _json(self, status: int, payload: dict) -> None:
+        body = json.dumps(payload, ensure_ascii=False).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _admin_ok(self) -> bool:
+        token = os.environ.get("SHOP_ADMIN_TOKEN", "")
+        if not FEATURES["admin"]:
+            self._json(404, {"error": "not found"})
+            return False
+        if len(token) < 16:
+            self._json(503, {"error": "admin_disabled", "message": "Chưa cấu hình SHOP_ADMIN_TOKEN"})
+            return False
+        given = self.headers.get("Authorization", "")
+        if not hmac.compare_digest(given.encode(), f"Bearer {token}".encode()):
+            self._json(401, {"error": "unauthorized"})
+            return False
+        return True
+
+    def do_GET(self):
+        path = self._path()
+        if path == "/api/products":
+            self._json(200, catalog_view())
+            return
+        if path == "/api/admin/orders":
+            if self._admin_ok():
+                self._json(200, {"orders": list(reversed(load_orders()))})
+            return
+        if self._blocked():
+            self.send_error(404)
+            return
+        super().do_GET()
+
+    def do_HEAD(self):
+        if self._blocked():
+            self.send_error(404)
+            return
+        super().do_HEAD()
+
+    def do_POST(self):
+        path = self._path()
+        routes = {"/api/orders": create_order}
+        if FEATURES["lookup"]:
+            routes["/api/orders/lookup"] = lookup
+        if path == "/api/admin/orders/status":
+            if not self._admin_ok():
+                return
+            routes[path] = set_status
+        handler = routes.get(path)
+        if handler is None:
+            self._json(404, {"error": "not found"})
+            return
+        length = int(self.headers.get("Content-Length") or 0)
+        if length > MAX_BODY:
+            self._json(413, {"error": "payload too large"})
+            return
+        try:
+            data = json.loads(self.rfile.read(length).decode("utf-8", errors="replace") or "{}")
+        except json.JSONDecodeError:
+            self._json(400, {"error": "invalid json"})
+            return
+        if not isinstance(data, dict):
+            self._json(400, {"error": "invalid body"})
+            return
+        self._json(*handler(data))
+
+
+def make_server(port: int = 8080, host: str = "127.0.0.1") -> ThreadingHTTPServer:
+    return ThreadingHTTPServer((host, port), Handler)
+
+
+if __name__ == "__main__":
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--port", type=int, default=8080)
+    ap.add_argument("--host", default="127.0.0.1")
+    ap.add_argument("--data", type=Path, default=None, help="thư mục lưu đơn hàng (mặc định api/data)")
+    args = ap.parse_args()
+    if args.data:
+        DATA = args.data
+    srv = make_server(args.port, args.host)
+    print(f"Serving on http://{args.host}:{srv.server_port}")
+    srv.serve_forever()

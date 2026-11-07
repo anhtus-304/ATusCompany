@@ -1,0 +1,121 @@
+"""Shop backend tests. Run from the project root:  python -m unittest discover -s api"""
+import json
+import os
+import secrets
+import shutil
+import sys
+import tempfile
+import threading
+import unittest
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import server  # noqa: E402
+
+TOKEN = secrets.token_hex(16)  # random per run, never a real secret in code
+
+
+class ShopTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = Path(tempfile.mkdtemp())
+        server.DATA = cls.tmp
+        os.environ["SHOP_ADMIN_TOKEN"] = TOKEN
+        cls.srv = server.make_server(0)
+        cls.base = f"http://127.0.0.1:{cls.srv.server_port}"
+        threading.Thread(target=cls.srv.serve_forever, daemon=True).start()
+        cls.catalog = server.products()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.srv.shutdown()
+        shutil.rmtree(cls.tmp, ignore_errors=True)
+
+    def setUp(self):
+        (self.tmp / "orders.json").unlink(missing_ok=True)
+
+    def call(self, method, path, data=None, token=None):
+        headers = {"Content-Type": "application/json"}
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+        body = json.dumps(data).encode() if data is not None else None
+        req = urllib.request.Request(self.base + path, data=body, method=method, headers=headers)
+        try:
+            with urllib.request.urlopen(req) as r:
+                return r.status, json.loads(r.read() or b"{}")
+        except urllib.error.HTTPError as e:
+            return e.code, json.loads(e.read() or b"{}")
+
+    def order(self, **over):
+        p = self.catalog[0]
+        data = {"name": "Nguyễn Văn A", "phone": "0901 234 567", "address": "12 Lê Lợi, Q1",
+                "payment": server.FEATURES["payments"][0], "items": [{"id": p["id"], "qty": 2}]}
+        data.update(over)
+        return self.call("POST", "/api/orders", data)
+
+    def test_catalog(self):
+        status, body = self.call("GET", "/api/products")
+        self.assertEqual(status, 200)
+        self.assertEqual(len(body["products"]), len(self.catalog))
+
+    def test_order_total_comes_from_catalog(self):
+        p = self.catalog[0]
+        status, body = self.order(items=[{"id": p["id"], "qty": 2, "price_vnd": 1}], total_vnd=1)
+        self.assertEqual(status, 201)
+        self.assertEqual(body["total_vnd"], p["price_vnd"] * 2)
+        self.assertTrue(body["code"].startswith("DH"))
+
+    def test_rejects_unknown_product_and_bad_qty(self):
+        self.assertEqual(self.order(items=[{"id": "khong-co", "qty": 1}])[0], 400)
+        self.assertEqual(self.order(items=[{"id": self.catalog[0]["id"], "qty": 0}])[0], 400)
+        self.assertEqual(self.order(items=[{"id": self.catalog[0]["id"], "qty": "2"}])[0], 400)
+        self.assertEqual(self.order(items=[])[0], 400)
+
+    def test_rejects_missing_fields_and_bad_payment(self):
+        self.assertEqual(self.order(phone="")[0], 400)
+        self.assertEqual(self.order(address="x" * 301)[0], 400)
+        self.assertEqual(self.order(payment="bitcoin")[0], 400)
+
+    def test_stock_limit(self):
+        if not server.FEATURES["stock"]:
+            self.skipTest("không quản lý tồn kho")
+        p = self.catalog[0]
+        status, _ = self.order(items=[{"id": p["id"], "qty": min(99, p["stock"] + 1)}])
+        self.assertEqual(status, 409 if p["stock"] < 99 else 201)
+
+    def test_lookup_needs_matching_phone(self):
+        if not server.FEATURES["lookup"]:
+            self.skipTest("không có tra cứu đơn")
+        _, body = self.order()
+        self.assertEqual(self.call("POST", "/api/orders/lookup", {"code": body["code"], "phone": "0999999999"})[0], 404)
+        status, found = self.call("POST", "/api/orders/lookup", {"code": body["code"], "phone": "0901234567"})
+        self.assertEqual(status, 200)
+        self.assertNotIn("address", found)
+
+    def test_admin_requires_token(self):
+        if not server.FEATURES["admin"]:
+            self.skipTest("không có trang quản lý")
+        _, body = self.order()
+        self.assertEqual(self.call("GET", "/api/admin/orders")[0], 401)
+        self.assertEqual(self.call("GET", "/api/admin/orders", token="sai")[0], 401)
+        status, listing = self.call("GET", "/api/admin/orders", token=TOKEN)
+        self.assertEqual(status, 200)
+        self.assertEqual(listing["orders"][0]["code"], body["code"])
+        self.assertEqual(self.call("POST", "/api/admin/orders/status", {"code": body["code"], "status": "paid"})[0], 401)
+        status, upd = self.call("POST", "/api/admin/orders/status", {"code": body["code"], "status": "paid"}, TOKEN)
+        self.assertEqual((status, upd["status"]), (200, "paid"))
+
+    def test_does_not_serve_source_or_data(self):
+        for path in ("/api/server.py", "/api/products.json", "/api/data/orders.json"):
+            with self.assertRaises(urllib.error.HTTPError) as ctx:
+                urllib.request.urlopen(self.base + path)
+            self.assertEqual(ctx.exception.code, 404)
+
+    def test_oversized_body_rejected(self):
+        self.assertEqual(self.call("POST", "/api/orders", {"x": "y" * 20000})[0], 413)
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -638,3 +638,111 @@ def test_push_to_client_github(tmp_path, monkeypatch):
     files = subprocess.run(["git", "-C", str(remotes / "mocoffee" / "website.git"), "ls-tree", "-r", "--name-only",
                             "main"], capture_output=True, text=True).stdout.split()
     assert "index.html" in files and not any(f.startswith("api/data") for f in files)
+
+
+# ---------------------------------------------------------------- phase 6: shops
+
+SHOP_MSG = "Làm web bán hàng online có giỏ hàng và thanh toán cho tiệm 'Mộc Coffee', ngân sách 30 triệu"
+
+
+def test_shop_is_detected_and_gets_shop_options(tmp_path):
+    sink = MemSink()
+    assert plan_project("sh1", SHOP_MSG, sink) == "awaiting_choice"
+    assert sink.artifacts["brief"]["kind"] == "shop"
+    spec = sink.artifacts["spec"]
+    assert spec["kind"] == "shop" and len(spec["products"]) == 6
+    assert [s["id"] for s in spec["sections"]][:2] == ["hero", "products"]
+    for o in sink.artifacts["proposal"]["options"]:
+        assert "cart" in o["features"] and {"cod", "bank_transfer"} & set(o["features"])
+        assert "contact_form" not in o["features"], "landing-only feature"
+        assert any("cổng thanh toán" in c for c in o["cons"]), "online gateway is a stated limit, not silently missing"
+    other = MemSink()
+    plan_project("sh2", MSG, other)
+    assert other.artifacts["brief"]["kind"] == "landing" and not other.artifacts["spec"]["products"]
+
+
+@pytest.mark.parametrize("option_id", ["A", "B", "C"])
+def test_every_shop_option_builds_and_passes(tmp_path, option_id):
+    sink = MemSink()
+    assert run_project("sh-" + option_id, SHOP_MSG, sink, tmp_path, choose=option_id) == "awaiting_approval"
+    qa = sink.artifacts["qa"]
+    names = [c["name"] for c in qa["checks"]]
+    assert qa["passed"] and not sink.artifacts["review"]["findings"]
+    assert "Tổng tiền tính ở server, bỏ qua giá gửi từ trình duyệt" in names
+    assert any(n.startswith("Test backend chạy và đạt") for n in names)
+    features = sink.artifacts["final_spec"]["features"]
+    project = tmp_path / ("sh-" + option_id)
+    assert (project / "cart.js").exists() and (project / "api" / "products.json").exists()
+    assert (project / "admin.html").exists() == ("admin_orders" in features)
+    assert ("Không cho đặt quá tồn kho" in names) == ("stock" in features)
+    assert not (project / "api" / "data").exists(), "QA ran in a copy"
+
+
+def test_qa_catches_shop_that_trusts_client_price(tmp_path, monkeypatch):
+    from ai import shop
+    original = shop.backend_files
+
+    def careless(spec):
+        files = original(spec)
+        for f in files:
+            if f.path == "api/server.py":
+                f.content = f.content.replace('"total_vnd": sum(x["price_vnd"] * x["qty"] for x in lines)',
+                                              '"total_vnd": int(data.get("total_vnd") or 0) or sum(x["price_vnd"] * x["qty"] for x in lines)')
+        return files
+
+    monkeypatch.setattr(shop, "backend_files", careless)
+    sink = MemSink()
+    assert run_project("sh-bad", SHOP_MSG, sink, tmp_path, choose="A") == "needs_review"
+    failed = [c for c in sink.artifacts["qa"]["checks"] if not c["passed"]]
+    names = [c["name"] for c in failed]
+    # Caught twice: by the backend's own test suite and by QA's black-box check.
+    assert "Tổng tiền tính ở server, bỏ qua giá gửi từ trình duyệt" in names
+    assert any(n.startswith("Test backend") for n in names) and len(names) == 2
+    assert all(c["owner"] == "backend_dev" for c in failed), "goes back to the backend dev, not the boss"
+
+
+def test_reviewer_flags_unsafe_cart_script(tmp_path):
+    from ai.artifacts import Spec
+    ws = Workspace(tmp_path, "rv")
+    ws.for_role("frontend_dev").write("cart.js", "list.innerHTML = '<li>' + item.name + '</li>';\neval(code);")
+    with pytest.raises(PermissionDenied):
+        ws.for_role("frontend_dev").write("api/products.json", "[]")
+    spec = Spec(project_name="x", page_title="x", goal="x", audience="x", language="vi", sections=[], cta_text="x",
+                palette=[], tech="x", acceptance_criteria=[])
+    rules = {f.rule for f in team.reviewer(MockLLM(CostTracker(1.0)), spec, ws.for_role("reviewer")).findings}
+    assert {"xss-innerhtml", "no-eval"} <= rules
+
+
+def test_deployed_shop_runs_its_own_backend(tmp_path, monkeypatch):
+    c, _ = _client(tmp_path, monkeypatch)
+    pid = c.post("/api/projects", json={"message": SHOP_MSG}).json()["id"]
+    _wait(c, pid)
+    c.post(f"/api/projects/{pid}/choice", json={"option_id": "B"})
+    p = _wait(c, pid)
+    assert p["status"] == "awaiting_approval", [e["text"] for e in p["events"]][-5:]
+    products = c.get(f"/staging/{pid}/api/products").json()["products"]
+    assert len(products) == 6 and all("in_stock" in x for x in products)
+    order = {"name": "Lan", "phone": "0901234567", "address": "1 Lê Lợi", "payment": "bank_transfer",
+             "items": [{"id": products[0]["id"], "qty": 2, "price_vnd": 1}]}
+    r = c.post(f"/staging/{pid}/api/orders", json=order)
+    assert r.status_code == 201 and r.json()["total_vnd"] == products[0]["price_vnd"] * 2
+    assert c.get(f"/staging/{pid}/api/server.py").status_code == 404
+    assert c.get(f"/staging/{pid}/api/admin/orders").status_code == 401
+    assert c.get(f"/api/projects/{pid}/admin-token").status_code == 409, "boss approval first"
+
+    c.post(f"/api/projects/{pid}/decision", json={"approve": True})
+    c.post(f"/api/projects/{pid}/deploy", json={"confirm": True})
+    r = c.post(f"/live/{pid}/api/orders", json={**order, "name": "Minh", "items": [{"id": products[1]["id"], "qty": 1}]})
+    assert r.status_code == 201
+    live = c.get(f"/api/projects/{pid}/orders").json()
+    assert [o["name"] for o in live["orders"]] == ["Minh"], "production and staging keep separate orders"
+    assert [o["name"] for o in c.get(f"/api/projects/{pid}/orders?env=staging").json()["orders"]] == ["Lan"]
+    token = c.get(f"/api/projects/{pid}/admin-token").json()["token"]
+    assert len(token) >= 16
+    r = c.get(f"/live/{pid}/api/admin/orders", headers={"Authorization": f"Bearer {token}"})
+    assert r.status_code == 200 and r.json()["orders"][0]["code"] == live["orders"][0]["code"]
+    assert "admin.html" in c.get(f"/live/{pid}/admin.html").text or c.get(f"/live/{pid}/admin.html").status_code == 200
+    data = tmp_path / "deploys" / pid / "data" / "production" / "orders.json"
+    assert "Minh" in data.read_text(encoding="utf-8")
+    assert not any("orders" in str(x) for x in (tmp_path / "deploys" / pid / "production").rglob("*"))
+    assert token not in (tmp_path / "ws" / pid / "api" / "server.py").read_text(), "token never in the repo"

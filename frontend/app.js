@@ -125,6 +125,10 @@ function render(p) {
     html += `<section class="box"><h3>Spec</h3><p><b>Mục tiêu:</b> ${esc(s.goal)}</p>
       <p><b>Đối tượng:</b> ${esc(s.audience)} · <b>Công nghệ:</b> ${esc(s.tech)}</p>
       <h4>Các mục</h4><ul>${s.sections.map((x) => `<li><code>#${esc(x.id)}</code> ${esc(x.heading)}: ${esc(x.purpose)}</li>`).join("")}</ul>
+      ${s.kind === "shop" && s.products?.length ? `<h4>Danh mục sản phẩm (${s.products.length})</h4>
+        <table class="tbl"><thead><tr><th>Mã</th><th>Sản phẩm</th><th>Giá</th><th>Tồn kho</th></tr></thead><tbody>
+        ${s.products.map((x) => `<tr><td><code>${esc(x.id)}</code></td><td>${esc(x.name)}</td><td>${vnd(x.price_vnd)}</td><td>${x.stock}</td></tr>`).join("")}
+        </tbody></table>` : ""}
       <h4>Tiêu chí nghiệm thu</h4>${list(s.acceptance_criteria)}</section>`;
   }
   if (a.brief) {
@@ -135,6 +139,8 @@ function render(p) {
   }
   html += `<section class="box"><h3>Nhật ký</h3><div class="events">${p.events.map((e) => esc(e.text)).join("\n")}</div></section>`;
   $("#detail").innerHTML = html;
+  const orders = $("#shop-orders");
+  if (orders) loadOrders(p.id, orders);
   return done;
 }
 
@@ -173,6 +179,15 @@ function renderDelivery(p) {
         <input id="branch" value="main" maxlength="100" class="short"><button class="secondary">Đẩy code</button></form>`
         : '<span class="muted small">Cần duyệt bàn giao trước.</span>'}</td></tr>
     </tbody></table>`;
+  const spec = a.final_spec || {};
+  if (spec.kind === "shop" && (spec.features || []).includes("admin_orders") && approved) {
+    const env = d.production ? "production" : "staging";
+    const base = env === "production" ? `/live/${encodeURIComponent(p.id)}/` : `/staging/${encodeURIComponent(p.id)}/`;
+    html += `<h4>Đơn hàng (${env === "production" ? "production" : "staging, đơn thử"})</h4>
+      <p class="small">Trang quản lý cho chủ shop: <a href="${base}admin.html" target="_blank" rel="noopener">${base}admin.html</a>
+        · <button type="button" class="secondary" data-admin-token>Hiện mã truy cập</button> <code id="admin-token"></code></p>
+      <div id="shop-orders" data-env="${env}" class="muted">Đang tải đơn…</div>`;
+  }
   if (approved || m) {
     const sent = m?.sent;
     html += `<h4>Email gửi khách</h4>${!m ? '<p class="muted">Báo cáo viên đang soạn…</p>' : `
@@ -188,6 +203,19 @@ function renderDelivery(p) {
       </form>`}`;
   }
   return html + "</section>";
+}
+
+const ORDER_STATUS = { new: "Mới", confirmed: "Đã xác nhận", paid: "Đã thanh toán", shipping: "Đang giao", done: "Hoàn tất", cancelled: "Đã hủy" };
+
+async function loadOrders(pid, box) {
+  try {
+    const r = await api(`/api/projects/${encodeURIComponent(pid)}/orders?env=${box.dataset.env}`);
+    box.classList.remove("muted");
+    box.innerHTML = r.orders.length ? `<table class="tbl"><thead><tr><th>Mã</th><th>Thời gian</th><th>Khách</th><th>Sản phẩm</th><th>Tổng</th><th>Trạng thái</th></tr></thead><tbody>
+      ${r.orders.map((o) => `<tr><td><code>${esc(o.code)}</code></td><td>${esc(o.at.replace("T", " "))}</td><td>${esc(o.name)} · ${esc(o.phone)}</td>
+        <td>${o.items.map((i) => `${esc(i.name)} × ${i.qty}`).join(", ")}</td><td>${vnd(o.total_vnd)}</td><td>${esc(ORDER_STATUS[o.status] || o.status)}</td></tr>`).join("")}
+      </tbody></table>` : '<p class="muted">Chưa có đơn hàng.</p>';
+  } catch (err) { box.textContent = err.message; }
 }
 
 function renderMemory(mem) {
@@ -312,6 +340,10 @@ $("#detail").addEventListener("click", async (e) => {
     return act(() => api(`/api/projects/${pid}/client-message`, { method: "POST" }));
   }
   if (e.target.closest("[data-save-mail]")) return act(saveMail);
+  if (e.target.closest("[data-admin-token]")) {
+    try { $("#admin-token").textContent = (await api(`/api/projects/${pid}/admin-token`)).token; } catch (err) { alert(err.message); }
+    return;
+  }
   const b = e.target.closest("[data-decide]");
   if (!b) return;
   const approve = b.dataset.decide === "1";

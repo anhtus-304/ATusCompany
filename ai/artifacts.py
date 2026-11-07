@@ -65,9 +65,14 @@ class ClientMemory(BaseModel):
         return "\n".join(lines)
 
 
+ProjectKind = Literal["landing", "shop"]
+
+
 class Brief(BaseModel):
     """Intake (Lễ tân) output: the client's request, cleaned up."""
 
+    kind: ProjectKind = Field(default="landing", description="shop nếu khách cần bán hàng online (giỏ hàng, đặt hàng, "
+                                                           "thanh toán); còn lại là landing")
     project_name: str = Field(description="Tên ngắn của dự án / thương hiệu")
     business_type: str = Field(description="Loại hình kinh doanh, ví dụ quán cà phê")
     goal: str = Field(description="Mục tiêu chính của landing page")
@@ -89,9 +94,20 @@ class Section(BaseModel):
 
 class ApiField(BaseModel):
     name: str
-    type: Literal["string", "email", "phone", "text"]
+    type: Literal["string", "email", "phone", "text", "choice", "items"]
     required: bool
     max_length: int = 500
+    choices: list[str] = Field(default_factory=list, description="Giá trị cho phép khi type là choice")
+
+
+class Product(BaseModel):
+    """One item in a shop's catalog. Prices are always taken from here by the backend, never from the client."""
+
+    id: str = Field(description="Mã sản phẩm kebab-case, duy nhất")
+    name: str
+    price_vnd: int = Field(ge=0)
+    description: str = ""
+    stock: int = Field(default=50, ge=0, description="Số lượng còn trong kho")
 
 
 class ApiEndpoint(BaseModel):
@@ -121,6 +137,8 @@ class Spec(BaseModel):
                                 description="Mã tính năng, được điền sau khi sếp chọn phương án")
     meta_description: str = Field(default="", description="Mô tả ngắn cho SEO, 1 câu")
     api: list[ApiEndpoint] = Field(default_factory=list, description="API backend, rỗng nếu trang tĩnh")
+    kind: ProjectKind = "landing"
+    products: list[Product] = Field(default_factory=list, description="Danh mục sản phẩm, chỉ khi kind là shop")
 
 
 Layout = Literal["hero", "grid", "list", "split", "faq", "form"]
@@ -155,7 +173,21 @@ FEATURES = {
     "faq_accordion": "Mục hỏi đáp dạng mở/đóng",
     "contact_form": "Form liên hệ lưu vào hệ thống (có backend API)",
     "seo_meta": "Meta description và Open Graph cho chia sẻ mạng xã hội",
+    # Shop features (kind == "shop")
+    "cart": "Giỏ hàng và trang đặt hàng",
+    "cod": "Thanh toán khi nhận hàng (COD)",
+    "bank_transfer": "Chuyển khoản ngân hàng, nội dung chuyển khoản là mã đơn",
+    "order_lookup": "Khách tra cứu trạng thái đơn bằng mã đơn và số điện thoại",
+    "admin_orders": "Trang quản lý đơn hàng có mã truy cập, đổi trạng thái đơn",
+    "stock": "Quản lý tồn kho, không cho đặt quá số còn",
 }
+LANDING_FEATURES = ["responsive", "sticky_nav", "dark_mode", "animations", "faq_accordion", "contact_form", "seo_meta"]
+SHOP_FEATURES = ["responsive", "sticky_nav", "dark_mode", "animations", "faq_accordion", "seo_meta",
+                 "cart", "cod", "bank_transfer", "order_lookup", "admin_orders", "stock"]
+
+
+def allowed_features(kind: str) -> list[str]:
+    return SHOP_FEATURES if kind == "shop" else LANDING_FEATURES
 
 
 class Option(BaseModel):
