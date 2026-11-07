@@ -1,0 +1,85 @@
+/* Token màu theo theme. Theme chỉ đổi màu, không đổi bố cục. */
+:root,
+:root[data-theme='sky'] {
+  --bg: #e8f2fb;
+  --surface: #ffffff;
+  --surface-2: #f3f7fc;
+  --border: #d4e1ef;
+  --border-strong: #b9cbe0;
+  --text: #1d2a3d;
+  --muted: #627189;
+  --accent: #3b82f6;
+  --accent-soft: #dbeafe;
+  --header: #ffffff;
+  --stage: #dfeefa;
+  --assign: #f97316;
+  --assign-hover: #ea580c;
+  --shadow: 0 1px 0 rgba(29, 42, 61, 0.06), 0 2px 8px rgba(29, 42, 61, 0.06);
+
+  --c-todo: #64748b;
+  --c-doing: #f97316;
+  --c-review: #8b5cf6;
+  --c-blocked: #d97706;
+  --c-error: #ef4444;
+  --c-done: #16a34a;
+  --s-idle: #22c55e;
+  --s-working: #f97316;
+  --s-blocked: #ef4444;
+
+  --g-lead: #2f3e66;
+  --g-code: #2563eb;
+  --g-creative: #16a34a;
+  color-scheme: light;
+}
+
+:root[data-theme='chibi-blue'] {
+  --bg: #e3f6f6;
+  --surface: #ffffff;
+  --surface-2: #effaf9;
+  --border: #c5e8e6;
+  --border-strong: #a2d7d4;
+  --text: #173b40;
+  --muted: #557a7f;
+  --accent: #14a3b0;
+  --accent-soft: #cff2f3;
+  --header: #fbffff;
+  --stage: #d6f1f4;
+  --g-lead: #1d7f8c;
+}
+
+:root[data-theme='chibi-pink'] {
+  --bg: #fdf0f5;
+  --surface: #ffffff;
+  --surface-2: #fff6f9;
+  --border: #f6d3e0;
+  --border-strong: #eeb7cc;
+  --text: #4a2337;
+  --muted: #8d6577;
+  --accent: #ec4899;
+  --accent-soft: #fde2ef;
+  --header: #fffafc;
+  --stage: #fde8f0;
+  --g-lead: #be3f78;
+  --g-code: #7c5ce0;
+  --g-creative: #db2777;
+}
+
+:root[data-theme='dark'] {
+  --bg: #0b111c;
+  --surface: #141c2b;
+  --surface-2: #1a2436;
+  --border: #253149;
+  --border-strong: #34425f;
+  --text: #e6edf7;
+  --muted: #93a1b8;
+  --accent: #60a5fa;
+  --accent-soft: #1e3355;
+  --header: #111827;
+  --stage: #0f1522;
+  --shadow: 0 1px 0 rgba(0, 0, 0, 0.3), 0 2px 10px rgba(0, 0, 0, 0.35);
+  --c-todo: #94a3b8;
+  --g-lead: #93a8e0;
+  --g-code: #60a5fa;
+  --g-creative: #4ade80;
+  color-scheme: dark;
+}
