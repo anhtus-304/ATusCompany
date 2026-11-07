@@ -15,9 +15,10 @@ interface Props {
   onSelect: (s: Selection) => void;
   onCollapse: () => void;
   collapseLabel: string;
+  onLocate?: (agentId: string) => void;
 }
 
-export function RightPanel({ tab, onTab, log, agents, tasks, selection, onSelect, onCollapse, collapseLabel }: Props) {
+export function RightPanel({ tab, onTab, log, agents, tasks, selection, onSelect, onCollapse, collapseLabel, onLocate }: Props) {
   return (
     <aside className="panel right-panel" aria-label="Nhật ký và chi tiết">
       <div className="panel-head">
@@ -50,6 +51,7 @@ export function RightPanel({ tab, onTab, log, agents, tasks, selection, onSelect
             tasks={tasks}
             onSelectAgent={(id) => onSelect({ kind: 'agent', id })}
             onSelectTask={(id) => onSelect({ kind: 'task', id })}
+            onLocate={onLocate}
           />
         </div>
       )}

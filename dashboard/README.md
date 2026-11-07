@@ -1,12 +1,19 @@
-# Dashboard “Văn phòng pixel”
+# Dashboard “Văn phòng”
 
-Giao diện cho sếp theo dõi đội AI agent của Virtual Tech Dept, vẽ như một văn phòng pixel thật:
-phòng Ban lãnh đạo, Xưởng code, Studio sáng tạo, bàn ghế, màn hình đang chạy mã, cây cảnh,
-và các nhân vật ngồi làm việc. Dashboard **chỉ hiển thị**, không chứa logic điều phối:
-mọi thay đổi đến từ server qua WebSocket.
+Giao diện cho sếp theo dõi đội AI agent của Virtual Tech Dept, vẽ như một văn phòng thật:
+phòng Ban lãnh đạo, Xưởng code, Studio sáng tạo, góc nghỉ, bàn ghế, màn hình đang chạy mã, cây cảnh,
+và các agent đang làm việc. Có hai kiểu văn phòng, chuyển bằng nút **3D / Pixel** ở góc trên phải:
+
+- **3D** (mặc định, Three.js): sàn văn phòng nhìn từ trên xuống, robot agent đứng ở bàn hai màn hình,
+  phòng kính Ban lãnh đạo, thành phố đêm phía sau. Kéo để xoay, chuột phải hoặc Shift+kéo để di chuyển,
+  cuộn để phóng to; nút ⟲ ⟳ + − ⌂ ở góc dưới phải. Nút “Tìm trong văn phòng” ở tab Chi tiết đưa camera tới agent.
+- **Pixel** (PixiJS): bản pixel-art 2D, nhẹ hơn, hợp máy yếu.
+
+Dashboard **chỉ hiển thị**, không chứa logic điều phối: mọi thay đổi đến từ server qua WebSocket.
 
 - React 19 + TypeScript + Vite
-- PixiJS 8 vẽ cảnh văn phòng (toàn bộ đồ họa là khối pixel vẽ bằng code, không cần file ảnh)
+- Three.js vẽ văn phòng 3D, PixiJS 8 vẽ bản pixel (đồ họa dựng hoàn toàn bằng code, không cần file ảnh hay model);
+  mỗi bản chỉ được tải khi được chọn
 - Thanh bên, nhật ký, thống kê dùng HTML/CSS thường
 - Font: Be Vietnam Pro cho nội dung, VT323 (có dấu tiếng Việt) cho tiêu đề và nhãn nhỏ, đóng gói sẵn qua `@fontsource` nên chạy được offline
 
@@ -83,6 +90,9 @@ src/
   types.ts            hợp đồng dữ liệu + nhãn tiếng Việt
   App.tsx             bố cục 3 cột + header + thanh giao việc, thu gọn cột, ngăn kéo trên màn hình hẹp
   components/         Header (thống kê, chuyển chế độ, theme, kết nối), PixelAvatar, Icons
+  scene3d/            Three.js: Office3D (cảnh, camera, robot đi lại, nhãn, pháo giấy), robot (robot dựng từ khối),
+                      props3d (sàn, khu, vách kính, thành phố, bàn, đồ đạc), screens3d (màn hình chạy mã),
+                      layout3d (mặt bằng, bàn, đường đi), palette3d (màu theo theme)
   scene/              PixiJS: OfficeRenderer (cảnh), Character (nhân vật, đi bộ, bong bóng),
                       furniture (sàn, tường, đồ đạc), screens (màn hình chạy mã), effects (pháo giấy),
                       layout (vị trí phòng, bàn, đường đi), sprites (nhân vật pixel), palette (màu theo theme)
@@ -96,6 +106,12 @@ src/
 ## Thêm agent hoặc đổi ngoại hình
 
 - Agent mới chỉ cần có trong `snapshot`; dashboard tự xếp vào bàn trống của nhóm
-  (Xưởng code 4 bàn, Studio 2 bàn, Ban lãnh đạo 1 ghế), hết bàn thì đứng ở chỗ dự phòng.
-- Ngoại hình theo `id` nằm trong `LOOKS` ở `src/scene/sprites.ts`; id lạ được sinh ngoại hình ổn định từ id.
-- Theme: thêm một bảng màu trong `src/scene/palette.ts` và một khối `:root[data-theme=...]` trong `src/styles/theme.css`.
+  (Xưởng code 4 bàn, Studio 2 bàn, Ban lãnh đạo 1 ghế), hết bàn thì đứng ở góc nghỉ (3D) hoặc chỗ dự phòng (pixel).
+  Thêm bàn: sửa `DESKS` trong `src/scene3d/layout3d.ts` và `SEATS` trong `src/scene/layout.ts`.
+- Ngoại hình theo `id` nằm trong `LOOKS` ở `src/scene/sprites.ts` (dùng chung cho nhân vật pixel và màu robot 3D);
+  id lạ được sinh ngoại hình ổn định từ id.
+- Theme: thêm bảng màu trong `src/scene/palette.ts`, `src/scene3d/palette3d.ts` và một khối `:root[data-theme=...]`
+  trong `src/styles/theme.css`.
+
+Tab **Chi tiết** của một task hiện luồng công việc Tiếp nhận → Lên kế hoạch → Thực hiện → Kiểm thử → Review → Hoàn thành,
+suy ra từ `Task.status` (và `activity: "testing"` của người nhận để biết đang ở bước Kiểm thử).

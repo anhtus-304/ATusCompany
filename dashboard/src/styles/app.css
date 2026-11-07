@@ -293,3 +293,74 @@ button { cursor: pointer; }
   .assign-to select { width: 100%; height: 36px; }
   .btn-assign { padding: 0 14px; }
 }
+
+/* ---------- Văn phòng 3D ---------- */
+.r3-overlay { position: absolute; inset: 0; pointer-events: none; overflow: hidden; }
+.r3-tag { position: absolute; left: 0; top: 0; display: flex; flex-direction: column; align-items: center; gap: 4px; will-change: transform; }
+.r3-name {
+  display: inline-flex; align-items: center; gap: 5px; padding: 2px 8px 2px 6px; border-radius: 99px;
+  font-size: 11.5px; font-weight: 600; white-space: nowrap; color: #e5e7eb;
+  background: rgba(15, 20, 32, 0.82); border: 1px solid rgba(255, 255, 255, 0.12); backdrop-filter: blur(4px);
+}
+.r3-name .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--sc); box-shadow: 0 0 6px var(--sc); }
+.r3-tag.selected .r3-name { border-color: #f59e0b; box-shadow: 0 0 0 2px rgba(245, 158, 11, 0.35); }
+.r3-overlay[data-night='0'] .r3-name { background: rgba(255, 255, 255, 0.92); color: #1e293b; border-color: rgba(15, 23, 42, 0.12); }
+.r3-bubble {
+  position: relative; padding: 3px 9px; border-radius: 8px; font-size: 11.5px; font-weight: 500; white-space: nowrap;
+  background: rgba(15, 20, 32, 0.9); color: #e2e8f0; border: 1px solid rgba(255, 255, 255, 0.14); max-width: 220px; overflow: hidden; text-overflow: ellipsis;
+}
+.r3-bubble::before { margin-right: 5px; }
+.r3-bubble[data-activity='typing']::before { content: '⌨'; }
+.r3-bubble[data-activity='reading']::before, .r3-bubble[data-activity='reviewing']::before { content: '📖'; }
+.r3-bubble[data-activity='thinking']::before { content: '💭'; }
+.r3-bubble[data-activity='testing']::before { content: '🧪'; }
+.r3-bubble[data-activity='drawing']::before { content: '🎨'; }
+.r3-bubble[data-activity='meeting']::before { content: '💬'; }
+.r3-bubble[data-activity='blocked'] { background: #7f1d1d; border-color: #ef4444; color: #fff; }
+.r3-bubble[data-activity='blocked']::before { content: '⚠'; }
+.r3-overlay[data-night='0'] .r3-bubble:not([data-activity='blocked']) { background: #fff; color: #1e293b; border-color: rgba(15, 23, 42, 0.15); }
+.r3-tag.s-blocked .r3-name { border-color: #ef4444; }
+
+.scene-mode { position: absolute; top: 10px; right: 10px; z-index: 4; box-shadow: var(--shadow); }
+.is-narrow .scene-mode { top: 54px; }
+.cam-tools {
+  position: absolute; right: 10px; bottom: 10px; z-index: 4; display: flex; gap: 4px; padding: 4px;
+  background: var(--surface); border: 1px solid var(--border); border-radius: 10px; box-shadow: var(--shadow);
+}
+.cam-tools button { width: 30px; height: 30px; border: 0; border-radius: 7px; background: transparent; font-size: 16px; color: var(--muted); }
+.cam-tools button:hover { background: var(--surface-2); color: var(--accent); }
+.cam-hint {
+  position: absolute; left: 50%; bottom: 14px; transform: translateX(-50%); z-index: 3; pointer-events: none;
+  font-size: 11px; letter-spacing: .04em; color: var(--muted); text-transform: uppercase; white-space: nowrap;
+}
+.scene-fallback { position: absolute; inset: 0; display: grid; place-items: center; }
+@media (max-width: 900px) { .cam-hint { display: none; } }
+
+.btn-locate {
+  display: inline-flex; align-items: center; gap: 6px; margin: 6px 0 4px; padding: 5px 10px; border-radius: 7px;
+  border: 1px solid var(--border-strong); background: var(--surface-2); font-size: 12.5px; font-weight: 600; color: var(--text);
+}
+.btn-locate:hover { border-color: var(--accent); color: var(--accent); }
+.progress { position: relative; height: 8px; border-radius: 99px; background: var(--surface-2); border: 1px solid var(--border); margin: 2px 40px 10px 0; }
+.progress span { position: absolute; inset: 0 auto 0 0; border-radius: 99px; background: var(--c-done); transition: width .4s; }
+.progress.bad span { background: var(--c-error); }
+.progress em { position: absolute; right: -40px; top: -6px; font-style: normal; font-size: 12px; font-weight: 700; color: var(--muted); }
+.workflow { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 2px; }
+.workflow li { display: flex; align-items: center; gap: 8px; padding: 4px 6px; border-radius: 6px; font-size: 13px; }
+.wf-dot { width: 16px; height: 16px; border-radius: 50%; display: grid; place-items: center; font-size: 10px; font-weight: 700; border: 2px solid var(--border-strong); color: #fff; flex: 0 0 auto; }
+.wf-done .wf-dot { background: var(--c-done); border-color: var(--c-done); }
+.wf-done .wf-label { color: var(--muted); }
+.wf-current { background: color-mix(in srgb, var(--accent) 12%, transparent); }
+.wf-current .wf-dot { border-color: var(--accent); box-shadow: inset 0 0 0 3px var(--surface), inset 0 0 0 8px var(--accent); }
+.wf-current .wf-label { font-weight: 700; }
+.wf-problem { background: color-mix(in srgb, var(--c-error) 12%, transparent); }
+.wf-problem .wf-dot { background: var(--c-error); border-color: var(--c-error); }
+.wf-problem .wf-label { font-weight: 700; }
+.wf-pending .wf-label { color: var(--muted); }
+.wf-who { margin-left: auto; font-size: 11.5px; color: var(--muted); }
+.wf-who.bad { color: var(--c-error); font-weight: 600; }
+@media (max-width: 640px) {
+  .r3-tag:not(.s-blocked):not(.selected) .r3-bubble { display: none !important; }
+  .r3-name { font-size: 10px; padding: 1px 6px 1px 5px; }
+  .r3-bubble { font-size: 10px; }
+}
