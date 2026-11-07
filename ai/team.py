@@ -15,6 +15,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
+from . import shop
 from .agents import prompt
 from .artifacts import (
     ApiEndpoint, ApiField, Check, CodeArtifact, DesignSpec, FileOut, Finding, ReviewReport,
@@ -72,7 +73,7 @@ def designer(llm: LLM, spec: Spec, ws: RoleView) -> DesignSpec:
     out = llm.structured("designer", prompt("designer"), f"Spec:\n{spec.model_dump_json(indent=2)}", DesignSpec)
     if out is None:
         pal = spec.palette + ["#3b2a20", "#a8652f", "#f6efe7", "#1f1a17"]
-        layouts = {"hero": "hero", "faq": "faq", "about": "split"}
+        layouts = {"hero": "hero", "faq": "faq", "about": "split", "products": "grid"}
         out = DesignSpec(
             colors={"brand": pal[0], "accent": pal[1], "surface": pal[2], "ink": pal[3], "muted": "#5c5047"},
             dark_colors={} if "dark_mode" not in spec.features else {"surface": "#171310"},
@@ -104,11 +105,18 @@ def backend_dev(llm: LLM, spec: Spec, ws: RoleView, failures: list[str] | None =
     if not spec.api:
         return None
     user = "API contract:\n" + json.dumps([e.model_dump() for e in spec.api], ensure_ascii=False, indent=2)
+    if spec.kind == "shop":
+        user += ("\n\nDanh mục (ghi nguyên vào api/products.json):\n"
+                 + json.dumps([p.model_dump() for p in spec.products], ensure_ascii=False, indent=2)
+                 + "\n\nTính năng: " + json.dumps(shop.flags(spec.features)))
     if failures:
         user += "\n\nLỗi cần sửa:\n" + "\n".join(f"- {f}" for f in failures)
         if previous:
             user += "\n\nCode lần trước:\n" + "\n\n".join(f"=== {f.path} ===\n{f.content}" for f in previous.files)
-    out = llm.structured("backend_dev", prompt("backend_dev"), user, CodeArtifact)
+    system = prompt("backend_dev") + ("\n\n" + prompt("backend_dev_shop") if spec.kind == "shop" else "")
+    out = llm.structured("backend_dev", system, user, CodeArtifact)
+    if out is None and spec.kind == "shop":
+        out = CodeArtifact(files=shop.backend_files(spec), notes="Sinh từ template offline (chế độ mock).")
     if out is None:
         endpoints = {e.path: {"fields": [f.model_dump() for f in e.fields], "success_status": e.success_status,
                               "store": e.path.strip("/").replace("/", "_") + ".jsonl"} for e in spec.api}
@@ -170,8 +178,12 @@ def _run_backend(spec: Spec, cwd: Path, add) -> None:
         add("Test backend chạy và đạt", False, f"Quá {TEST_TIMEOUT}s")
 
     port = _free_port()
-    proc = subprocess.Popen([sys.executable, "api/server.py", "--port", str(port)], cwd=cwd,
-                            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, env=_sandbox_env())
+    data_dir = cwd / ".qa-data"
+    token = "qa-" + os.urandom(12).hex()
+    # Same way production starts it: a data folder outside the code, and the admin code from the environment.
+    proc = subprocess.Popen([sys.executable, "api/server.py", "--port", str(port), "--data", str(data_dir)], cwd=cwd,
+                            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
+                            env=_sandbox_env() | {"SHOP_ADMIN_TOKEN": token})
     base = f"http://127.0.0.1:{port}"
     try:
         up = False
@@ -186,7 +198,9 @@ def _run_backend(spec: Spec, cwd: Path, add) -> None:
                 time.sleep(0.1)
         add("Server khởi động và phục vụ trang chủ", up,
             proc.stderr.read() if proc.poll() is not None and proc.stderr else "Không kết nối được")
-        if up:
+        if up and spec.kind == "shop":
+            shop.runtime_checks(spec, base, data_dir, token, add)
+        elif up:
             for ep in spec.api:
                 good = {f.name: {"phone": "0901234567", "email": "a@b.vn"}.get(f.type, "Khách thử") for f in ep.fields}
                 st = _post(base + ep.path, good)
@@ -198,6 +212,8 @@ def _run_backend(spec: Spec, cwd: Path, add) -> None:
                     bad.pop(req[0])
                     st = _post(base + ep.path, bad)
                     add(f"{ep.method} {ep.path} từ chối thiếu '{req[0]}'", st == 400, f"Trả {st}, cần 400")
+            stored = [x for x in data_dir.rglob("*") if x.is_file()] if data_dir.is_dir() else []
+            add("Dữ liệu được lưu vào thư mục --data", bool(stored), f"Không có file nào trong {data_dir.name}")
             st = _get_status(base + "/api/server.py")
             add("Không lộ mã nguồn backend qua HTTP", st == 404, f"/api/server.py trả {st}")
     finally:
@@ -242,6 +258,14 @@ _PY_RULES = [
     (re.compile(r"traceback\.format_exc\(\)|str\(e\)\s*\}"), "major", "leak-errors", "Không trả chi tiết lỗi cho người dùng"),
     (re.compile(r"[\"']0\.0\.0\.0[\"']"), "minor", "bind-all", "Mặc định nên lắng nghe 127.0.0.1"),
 ]
+_JS_RULES = [
+    (re.compile(r"\b(eval|Function)\s*\(|setTimeout\s*\(\s*[\"']"), "blocker", "no-eval", "Không chạy chuỗi như code"),
+    (re.compile(r"\.(innerHTML|outerHTML)\s*\+?=\s*(?![\"'`]\s*[\"'`];)"), "major", "xss-innerhtml",
+     "Gán innerHTML từ dữ liệu dễ bị XSS, dùng textContent/createElement"),
+    (re.compile(r"document\.write\s*\("), "major", "document-write", "Không dùng document.write"),
+    (re.compile(r"localStorage\.setItem\([^)]*(token|password)", re.I), "major", "secret-storage",
+     "Không lưu mã truy cập lâu dài trong localStorage"),
+]
 _HTML_RULES = [
     (re.compile(r"\son[a-z]+\s*=\s*[\"']", re.I), "major", "inline-handler", "Không dùng thuộc tính sự kiện nội tuyến"),
     (re.compile(r"href\s*=\s*[\"']\s*javascript:", re.I), "blocker", "javascript-url", "Không dùng liên kết javascript:"),
@@ -270,6 +294,10 @@ def _static_review(spec: Spec, ws: RoleView) -> list[Finding]:
                 if not re.search(r"max_length|MAX_BODY|Content-Length", text):
                     findings.append(Finding(severity="major", owner=owner, file=rel, rule="input-limits",
                                             message="Thiếu giới hạn độ dài trường hoặc kích thước body"))
+        if rel.endswith(".js"):
+            for rx, sev, rule, msg in _JS_RULES:
+                if rx.search(text):
+                    findings.append(Finding(severity=sev, owner=owner, file=rel, rule=rule, message=msg))
         if rel.endswith(".html"):
             for rx, sev, rule, msg in _HTML_RULES:
                 if rx.search(text):
@@ -279,7 +307,8 @@ def _static_review(spec: Spec, ws: RoleView) -> list[Finding]:
                     findings.append(Finding(severity="minor", owner=owner, file=rel, rule="noopener",
                                             message="Liên kết target=_blank cần rel=\"noopener\""))
             for m in re.finditer(r"<form\b[^>]*>(.*?)</form>", text, re.I | re.S):
-                if re.search(r"<input(?![^>]*maxlength)[^>]*>", m.group(1), re.I):
+                if re.search(r"<input(?![^>]*maxlength)(?![^>]*type=\"?(radio|checkbox|hidden|submit)\b)[^>]*>",
+                             m.group(1), re.I):
                     findings.append(Finding(severity="minor", owner=owner, file=rel, rule="input-maxlength",
                                             message="Ô nhập nên có maxlength khớp contract"))
                     break
@@ -289,7 +318,7 @@ def _static_review(spec: Spec, ws: RoleView) -> list[Finding]:
 def reviewer(llm: LLM, spec: Spec, ws: RoleView) -> ReviewReport:
     findings = _static_review(spec, ws)
     files = "\n\n".join(f"=== {f} ===\n{ws.read(f)}" for f in ws.list_files()
-                        if f.endswith((".py", ".html", ".css")))
+                        if f.endswith((".py", ".html", ".css", ".js", ".json")))
     out = llm.structured("reviewer", prompt("reviewer"),
                          f"Spec:\n{spec.model_dump_json(indent=2)}\n\nCode:\n{files}", ReviewReport)
     if out is not None:

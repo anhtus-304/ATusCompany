@@ -9,3 +9,11 @@ def _isolated_delivery(tmp_path, monkeypatch):
     monkeypatch.delenv("VTD_SMTP_HOST", raising=False)
     monkeypatch.delenv("VTD_GITHUB_TOKEN", raising=False)
     monkeypatch.delenv("VTD_GITHUB_URL", raising=False)
+
+
+@pytest.fixture(autouse=True)
+def _stop_deployed_backends():
+    """Deployed sites start their own backend process; never leave one running after a test."""
+    yield
+    from backend import delivery
+    delivery.stop_all()
