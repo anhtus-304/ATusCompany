@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Virtual Tech Dept</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<header class="bar">
+  <strong>Virtual Tech Dept</strong>
+  <span class="muted">Phòng công nghệ ảo · Giai đoạn 1</span>
+</header>
+<div class="layout">
+  <aside>
+    <form id="new">
+      <label for="msg">Yêu cầu của khách</label>
+      <textarea id="msg" rows="5" placeholder="Ví dụ: Làm landing page cho quán cà phê 'Mộc Coffee' ở Đà Lạt, ngân sách 5 triệu, cần trong 1 tuần"></textarea>
+      <div class="row">
+        <label for="budget" class="small">Trần chi phí model ($)</label>
+        <input id="budget" type="number" min="0.1" step="0.1" value="2">
+      </div>
+      <button type="submit">Giao việc</button>
+    </form>
+    <h3>Dự án</h3>
+    <ul id="projects"></ul>
+  </aside>
+  <main id="detail"><p class="muted">Giao việc mới hoặc chọn một dự án.</p></main>
+</div>
+<script src="app.js"></script>
+</body>
+</html>
